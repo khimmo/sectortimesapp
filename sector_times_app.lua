@@ -6,6 +6,7 @@
 local json = require('json')
 
 local defaults = {
+  showBackground  = true,
   countInvalids   = false,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
   auto_placement_interval = 1.0, -- ADD THIS LINE (default to 1 second)
@@ -866,6 +867,8 @@ local function drawLapBlock(title, lap, opts)
   end
 end
 
+
+
 local DeltaFont = ui.DWriteFont('Arial', './data')
     :weight(ui.DWriteFont.Weight.Bold)
     :style(ui.DWriteFont.Style.Normal)
@@ -873,6 +876,19 @@ local DeltaFont = ui.DWriteFont('Arial', './data')
 
 function windowMain(dt)
   -- RUN OUR PER-FRAME GATE LOGIC
+  --ui.setNextWindowSize(vec2(windowWidth, windowHeight))
+
+  if settings.showBackground then
+    local p1 = vec2(0, 0)
+    --local p2 = ui.windowSize()
+    local p2 = vec2(300,350)
+    local col = ui.styleColor(ui.StyleColor.WindowBg)
+    
+    local rounding =0.0 
+    
+    ui.drawRectFilled(p1, p2, col, rounding)
+  end
+
   checkGateCrossing(dt)
 
   -- If reference mode changed, resnapshot immediately
@@ -1026,7 +1042,6 @@ local function drawGateEditor()
   end
 end
 
-
 -- Separate Settings window (gear button)
 function windowSettings(dt)
   -- Helper to avoid nil-table crashes when counting
@@ -1036,8 +1051,13 @@ function windowSettings(dt)
 
     -- ===== Main Settings Tab (was "Display") =====
     ui.tabItem("Settings", function() -- Renamed tab from "Display" to "Settings"
-      ui.text("Sector Times Settings")
-      ui.separator()
+      --ui.text("Sector Times Settings")
+      --ui.separator()
+
+      if ui.checkbox("Show Window Background", settings.showBackground) then
+    settings.showBackground = not settings.showBackground
+  end
+  --ui.separator()
 
       -- Checkbox for counting invalids removed, as per your request
       if ui.checkbox("Count invalid laps towards session PB's", settings.countInvalids) then
@@ -1045,7 +1065,10 @@ function windowSettings(dt)
       end
 
       ui.separator()
-      ui.text("Personal Best Management")
+      ui.separator()
+      
+      --ui.text("Personal Best Management")
+      --ui.text()
       
       local cr     = current_route or { name = "", gates = {} }
       local loopName = (cr.name ~= "" and cr.name) or (current and current.track or "") or ""
@@ -1055,7 +1078,7 @@ function windowSettings(dt)
       
       ui.text("Loop: " .. (loopName ~= "" and loopName or "— (no route loaded)"))
 
-      ui.separator()
+      --ui.separator()
       
       if ui.button("Load PB times for this car") then
         local ok, err = loadAllPBsForCar()
