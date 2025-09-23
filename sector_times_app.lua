@@ -6,7 +6,6 @@
 local json = require('json')
 
 local defaults = {
-  showInvalid     = true,    -- highlight invalid labels in red
   countInvalids   = false,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
   auto_placement_interval = 1.0, -- ADD THIS LINE (default to 1 second)
@@ -57,9 +56,6 @@ if not cloneTable then
     return r
   end
 end
-
-saveIndex = saveIndex or { items = {}, schema = 1 }
-
 
 local function sectorCountFor(trackName) return manualCount[trackName] or 3 end
 
@@ -112,38 +108,30 @@ end
 local SAVE_INDEX_FILE = 'saved_laps_index.json'  -- index kept in app root for simplicity
 --local saveIndex = { items = {}, schema = 1 }
 
-local function loadSaveIndex()
-  ac.log("[Saves] Loading save index from disk...")
-  
-  -- Always start with a fresh table to ensure no old data remains
-  saveIndex = { items = {}, schema = 1 }
-
-  local index_path = appPath(SAVE_INDEX_FILE)
-  local s = io.load(index_path)
-  
-  if s and s ~= "" then
-    local ok, data = pcall(json.decode, s)
-    if ok and type(data) == 'table' and type(data.items) == 'table' then
-      saveIndex = data
-      ac.log("[Saves] Successfully decoded index. Loaded " .. #saveIndex.items .. " items.")
-    else
-      ac.log("[Saves] ERROR: Failed to decode or parse JSON from index file.")
-    end
-  else
-    ac.log("[Saves] Index file not found or is empty.")
+-- NEW SAVE FUNCTION: Overwrites the PB file for a specific loop/car pair.
+local function saveBestLapForPair(payload)
+  if not payload or not payload.loopKey or not payload.carKey then
+    ac.log("[Saves] Aborted save: missing loop or car key.")
+    return false
   end
+
+  local loopDir = appPath(SAVE_FOLDER .. payload.loopKey .. "/")
+  local savePath = loopDir .. payload.carKey .. ".json"
+
+  ac.log(string.format("[Saves] New PB! Saving lap for '%s' / '%s'", payload.loopName, payload.carLabel))
+
+  -- Ensure the loop's directory exists
+  if not io.dirExists(loopDir) then
+    io.createDir(loopDir)
+    ac.log("[Saves] Created new directory: " .. loopDir)
+  end
+
+  -- Save the file, overwriting any previous PB.
+  io.save(savePath, json.encode(payload))
+  ac.log("[Saves] Saved file to: " .. savePath)
+  return true
 end
 
-local function saveSaveIndex()
-  ac.log("[Saves] Attempting to save index with " .. #saveIndex.items .. " items.")
-  local encoded_data = json.encode(saveIndex)
-  if encoded_data then
-    io.save(appPath(SAVE_INDEX_FILE), encoded_data)
-    ac.log("[Saves] Index saved successfully.")
-  else
-     ac.log("[Saves] ERROR: Failed to encode save index to JSON. Nothing was saved.")
-  end
-end
 
 local function getCarKeyAndLabel()
   local function try(fn, ...)
@@ -225,58 +213,76 @@ local function saveCurrentGateSnapshot()
 end
 
 -- NEW FUNCTION to load all PBs for the current car
-local function loadAllBestLapsForCar()
-
-  loadSaveIndex()
-
+-- NEW LOAD FUNCTION: Scans the filesystem for all PBs for the current car.
+local function loadAllPBsForCar()
   local carKey, carLabel = getCarKeyAndLabel()
   if not carKey or carKey == "unknown_car" then
     return false, "Could not identify the current car."
   end
   
-  ac.log(string.format("[Saves] Searching for all best laps for car: %s (%s)", carLabel, carKey))
+  ac.log(string.format("[Saves] Scanning for all PBs for car: %s (%s)", carLabel, carKey))
 
-  -- Step 1: Find the single best lap ID for each unique loop for this car
-  local bestLapsByLoop = {} -- { [loopKey] = { bestTime = 12345, snapshotID = "...", loopName = "..." } }
-  for _, item in ipairs(saveIndex.items or {}) do
-    if item.carKey == carKey then
-      local loopKey = item.loopKey
-      local lapTime = item.lapMS or 999999999 -- Use a huge number for laps with no time
-      
-      if not bestLapsByLoop[loopKey] or lapTime < bestLapsByLoop[loopKey].bestTime then
-        bestLapsByLoop[loopKey] = {
-          bestTime = lapTime,
-          snapshotID = item.id,
-          loopName = item.loopName
-        }
-      end
-    end
+  -- Step 1: Get all subdirectories in the 'savedtimes' folder.
+  local saveDir = appPath(SAVE_FOLDER)
+  if not io.dirExists(saveDir) then
+    ac.log("[Saves] Save folder does not exist yet. Nothing to load.")
+    return false, "Save folder does not exist yet."
   end
-  
-  -- Step 2: Now load the data from each of those best lap files
+
+  -- Use io.scanDir and filter for directories to get our loop keys
+  local loopDirs = {}
+  io.scanDir(saveDir, '*', function(entryName, attributes)
+    if attributes.isDirectory then
+      table.insert(loopDirs, entryName)
+    end
+  end)
+
+  if #loopDirs == 0 then
+    ac.log("[Saves] No loop directories found in 'savedtimes'. Nothing to load.")
+    return false, "No saved PBs found for this car."
+  end
+  ac.log("[Saves] Found " .. #loopDirs .. " possible loop folders. Checking for saved PBs...")
+
+  -- Step 2: Iterate through the found loop directories and check for a corresponding PB file.
   local loadedCount = 0
-  for loopKey, data in pairs(bestLapsByLoop) do
-    local raw = io.load(appPath("savedlap_" .. data.snapshotID .. ".json"))
-    if not raw then
-      ac.log(string.format("[Saves] WARNING: Snapshot file missing for loop '%s', ID: %s", data.loopName, data.snapshotID))
-    else
-      local ok, lapData = pcall(json.decode, raw)
-      if ok and type(lapData) == 'table' and type(lapData.gateSplits) == 'table' then
-        -- This is where we populate the session's PB data
-        bestGateSplits[loopKey] = cloneTable(lapData.gateSplits)
-        ac.log(string.format("[Saves] Loaded PB for '%s': %s", data.loopName, fmtMS(lapData.lapMS)))
-        loadedCount = loadedCount + 1
-      else
-        ac.log(string.format("[Saves] WARNING: Corrupt snapshot file for loop '%s', ID: %s", data.loopName, data.snapshotID))
+  for _, loopKey in ipairs(loopDirs) do
+    local pbFile = saveDir .. loopKey .. "/" .. carKey .. ".json"
+    if io.fileExists(pbFile) then
+      local raw = io.load(pbFile)
+      if raw then
+        local ok, lapData = pcall(json.decode, raw)
+        if ok and type(lapData) == 'table' then
+          local currentLoopKey = lapData.loopKey or loopKey
+
+          -- A. Load Gate Splits (for delta timing)
+          if type(lapData.gateSplits) == 'table' then
+            lapData.gateSplits.lapMS = lapData.lapMS
+            bestGateSplits[currentLoopKey] = cloneTable(lapData.gateSplits)
+          end
+          
+          -- B. Load Server Sector Times (for UI display)
+          if type(lapData.serverSectors) == 'table' and lapData.lapMS then
+            bestLap[currentLoopKey] = {
+              lap = lapData.lapMS / 1000,
+              secs = cloneTable(lapData.serverSectors)
+            }
+            for i, secTime in ipairs(lapData.serverSectors) do
+              updBestSector(currentLoopKey, i, secTime, false)
+            end
+          end
+
+          ac.log(string.format("[Saves] Loaded PB for '%s': %s", lapData.loopName, fmtMS(lapData.lapMS)))
+          loadedCount = loadedCount + 1
+        end
       end
     end
   end
 
   if loadedCount == 0 then
-    return false, "No saved snapshots found for this car."
+    return false, "No saved PBs found for this car."
   end
 
-  -- Step 3: Refresh the active PB for the current loop, if it was just loaded
+  -- Refresh the active PB for the current loop, if one was just loaded
   local currentLoopKey = toKey((current_route and current_route.name) or (current and current.track) or "")
   if currentLoopKey ~= "" and bestGateSplits[currentLoopKey] then
     active_gate_pb = bestGateSplits[currentLoopKey]
@@ -544,7 +550,7 @@ local function drawDeltaInline(delta)
 end
 
 -- update hidden PBs
-local function updBestSector(trackK, idx, val, inval)
+function updBestSector(trackK, idx, val, inval)
   if not trackK or trackK=="" or not val then return false end
   if inval and not settings.countInvalids then return false end
   bestSecs[trackK] = bestSecs[trackK] or { secs={} }
@@ -703,13 +709,71 @@ local function feed(msg)
         updBestLap(toKey(last.track), last.lap, last.secs, last.lapInv)
       end
       
+      -- REVISED AUTOMATIC SAVE LOGIC --
       if #active_route_gates > 0 and #current_run_gate_splits == #active_route_gates then
+        
+        local official_lap_ms = last.lap * 1000
         local trackKey = toKey(last.track)
-        local old_pb_final_time = bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]
-        local new_final_time = current_run_gate_splits[#current_run_gate_splits]
-        if not old_pb_final_time or new_final_time < old_pb_final_time then
-          ac.log("New personal best gate splits saved for '" .. last.track .. "'.")
-          bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+        
+        -- Get the current session's PB for in-memory update
+        local session_pb_final_time_ms = nil
+        local session_pb_splits = bestGateSplits[trackKey]
+        if session_pb_splits and session_pb_splits.lapMS then
+          session_pb_final_time_ms = session_pb_splits.lapMS
+        end
+
+        -- Step 1: Update the IN-MEMORY session PB if this lap is the best for this session
+        -- This happens REGARDLESS of lap validity. An invalid lap can still be a session PB.
+        if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
+          ac.log("New session best splits for '" .. last.track .. "'.")
+          local session_pb_data = cloneTable(current_run_gate_splits)
+          session_pb_data.lapMS = official_lap_ms
+          session_pb_data.serverSectors = cloneTable(last.secs) -- also store server sectors for the session PB
+          bestGateSplits[trackKey] = session_pb_data
+        end
+
+        -- Step 2: Check if the lap is valid. If not, STOP here and do not save to disk.
+        if last.lapInv then
+          ac.log("[Saves] Lap was invalid. Skipping all-time PB check and save.")
+        else
+          -- Step 3: Check against the ALL-TIME PB on disk to decide whether to save
+          local carKey, carLabel = getCarKeyAndLabel()
+          local all_time_pb_file = appPath(SAVE_FOLDER .. trackKey .. "/" .. carKey .. ".json")
+          local all_time_pb_ms = nil
+
+          if io.fileExists(all_time_pb_file) then
+            local raw = io.load(all_time_pb_file)
+            if raw then
+              local ok, data = pcall(json.decode, raw)
+              if ok and data.lapMS then
+                all_time_pb_ms = data.lapMS
+              end
+            end
+          end
+          
+          -- Step 4: Compare and Save ONLY if the OFFICIAL server time is a valid all-time best
+          if not all_time_pb_ms or official_lap_ms < all_time_pb_ms then
+            ac.log(string.format("New ALL-TIME PB! Old: %s, New: %s. Saving.", 
+              fmtMS(all_time_pb_ms), fmtMS(official_lap_ms)))
+              
+            local payload = {
+              schema = 2,
+              appVersion = "0.2",
+              loopName = last.track,
+              loopKey = trackKey,
+              carKey = carKey,
+              carLabel = carLabel,
+              gateCount = #active_route_gates,
+              gateSplits = cloneTable(current_run_gate_splits),
+              lapMS = official_lap_ms,
+              serverSectors = cloneTable(last.secs),
+              created = os.time()
+            }
+            saveBestLapForPair(payload)
+          else
+            ac.log(string.format("Lap time (%s) is not an all-time PB (%s). Not saving.",
+              fmtMS(official_lap_ms), fmtMS(all_time_pb_ms)))
+          end
         end
       end
       
@@ -717,7 +781,7 @@ local function feed(msg)
       current = newLapState()
       current.track = trackName
       snapshotActivePB(trackName)
-      -- ===================================
+      -- ==================================
       
       return
     end
@@ -732,7 +796,7 @@ end)
 
 -- ===== UI =====
 local function labelText(txt, invalidFlag)
-  if settings.showInvalid and invalidFlag then
+  if invalidFlag then
     textColoredCompat(txt, COL_RED)
   else
     ui.text(txt)
@@ -963,120 +1027,67 @@ local function drawGateEditor()
 end
 
 
--- Separate Settings window (gear button)x
+-- Separate Settings window (gear button)
 function windowSettings(dt)
   -- Helper to avoid nil-table crashes when counting
   local function tlen(t) return (type(t) == "table") and #t or 0 end
 
   ui.tabBar("SettingsTabs", function()
 
-    -- ===== Display tab =====
-    ui.tabItem("Display", function()
+    -- ===== Main Settings Tab (was "Display") =====
+    ui.tabItem("Settings", function() -- Renamed tab from "Display" to "Settings"
       ui.text("Sector Times Settings")
       ui.separator()
 
-      if ui.checkbox("Highlight invalid labels in red", settings.showInvalid) then
-        settings.showInvalid = not settings.showInvalid
-      end
-      if ui.checkbox("Count invalids as PB", settings.countInvalids) then
+      -- Checkbox for counting invalids removed, as per your request
+      if ui.checkbox("Count invalid laps towards session PB's", settings.countInvalids) then
         settings.countInvalids = not settings.countInvalids
       end
-      if ui.checkbox("Use fastest individual sectors (theoretical reference)", settings.refBestSectors) then
-        settings.refBestSectors = not settings.refBestSectors
-        snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
-        lastRefToggle = settings.refBestSectors
-      end
 
       ui.separator()
-      if ui.button("Reset All Laps/Sectors/PBs") then
-        resetAllData()
-      end
-    end)
-
-    -- ===== Route Editor tab =====
-    ui.tabItem("Route Editor", function()
-      drawGateEditor()
-    end)
-
-    -- ===== Saves tab =====
-    ui.tabItem("Saves", function()
-      -- Defensive defaults so UI never crashes if globals are nil
+      ui.text("Personal Best Management")
+      
       local cr     = current_route or { name = "", gates = {} }
-      local splits = current_run_gate_splits or {}
-
-      -- Loop & car labels
       local loopName = (cr.name ~= "" and cr.name) or (current and current.track or "") or ""
       local carKey, carLabel = getCarKeyAndLabel()
-
-      ui.text("Loop: " .. (loopName ~= "" and loopName or "— (no route loaded)"))
+      
       ui.text("Car:  " .. tostring(carLabel))
+      
+      ui.text("Loop: " .. (loopName ~= "" and loopName or "— (no route loaded)"))
+
       ui.separator()
-
-      -- Status lines
-      local gatesCount  = tlen(cr.gates)
-      local splitsCount = tlen(splits)
-      ui.text(string.format("Gates in current route: %d", gatesCount))
-      ui.text(string.format("Current run splits recorded: %d", splitsCount))
-      ui.separator()
-
-      -- Save button:
-      -- On CSP builds without beginDisabled/endDisabled, we render the button
-      -- and ignore clicks if saving isn't allowed, plus show why.
-      local canSave = (gatesCount > 0 and splitsCount > 0)
-      if ui.button("Save current gate lap") then
-        if canSave then
-          local ok, err = saveCurrentGateSnapshot()
-          if not ok and err then ac.log("[Saves] Save failed: " .. tostring(err)) end
-        end
-      end
-      if not canSave then
-        if gatesCount == 0 then ui.text("• No route/gates loaded.") end
-        if splitsCount == 0 then ui.text("• No recorded gate splits this run yet (finish a lap).") end
-      end
-
-      ui.sameLine()
-      if ui.button("Load all PBs for this car") then
-        local ok, err = loadAllBestLapsForCar() -- Call the new function
+      
+      if ui.button("Load PB times for this car") then
+        local ok, err = loadAllPBsForCar()
         if not ok and err then ac.log("[Saves] Load failed: " .. tostring(err)) end
       end
 
-      ui.separator()
-      -- Count how many saves exist for this loop+car
-      local count, lk = 0, (toKey and toKey(loopName)) or (string.lower(loopName):gsub("%s+","_"))
-      if saveIndex and saveIndex.items then
-        for _, it in ipairs(saveIndex.items) do
-          if it.loopKey == lk and it.carKey == carKey then count = count + 1 end
+      ui.sameLine()
+      if ui.button("Clear saved PB for this loop") then
+        local loopKey = toKey(loopName)
+        if loopKey ~= "" and carKey ~= "" and carKey ~= "unknown_car" then
+          local pbFile = appPath(SAVE_FOLDER .. loopKey .. "/" .. carKey .. ".json")
+          if io.fileExists(pbFile) then
+            os.remove(pbFile)
+            bestGateSplits[loopKey] = nil
+            bestLap[loopKey] = nil
+            active_gate_pb = {}
+            activePB = { secs={}, lap=nil, theoretical=false }
+            ac.log("[Saves] Deleted PB file: " .. pbFile)
+          else
+            ac.log("[Saves] No PB file exists to be deleted for this pair.")
+          end
         end
       end
-      ui.text(string.format("Saved snapshots for this pair: %d", count))
-
-      -- Optional: quick utility to clear active PB for this loop (handy for testing)
-      if ui.button("Clear active PB for this loop") then
-        if lk and lk ~= "" then
-          bestGateSplits[lk] = nil
-          if active_gate_pb and active_gate_pb == bestGateSplits[lk] then active_gate_pb = nil end
-          ac.log("[Saves] Cleared active PB for loop: " .. tostring(loopName))
-        else
-          ac.log("[Saves] No loop loaded to clear.")
-        end
-      end
-
-      ui.separator()
-      if ui.button("DEBUG: Force Reload Index from File") then
-        ac.log("[Saves] Manual index reload triggered by user.")
-        loadSaveIndex()
-      end
-
-      -- DEBUG: print what we’re matching
-
     end)
-
+    ui.tabItem("Route Editor", function()
+      drawGateEditor()
+    end)
   end)
 end
 
-
-
 function windowTitle() return "Sector Times" end
+
 function windowFlags()
   local f = ui.WindowFlags.AlwaysAutoResize  -- keep gear button visible; manifest controls SETTINGS
   
