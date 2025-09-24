@@ -6,6 +6,7 @@
 local json = require('json')
 
 local defaults = {
+  showDebugGates  = false,
   showBackground  = true,
   countInvalids   = false,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
@@ -17,7 +18,7 @@ local SAVE_FOLDER = "savedtimes/"
 
 local gate_editor_active = false -- a flag to know when to draw gates on a map (future use)
 local current_route = { name = "", gates = {} }
-local GATE_WIDTH = 20.0 -- Default gate width in meters
+local GATE_WIDTH = 30.0 -- Default gate width in meters
 local gate_debounce_timer = 0.0
 
 -- NEW: State for automatic gate placement
@@ -867,6 +868,65 @@ local function drawLapBlock(title, lap, opts)
   end
 end
 
+local function drawDebugGates()
+  if #current_route.gates == 0 then return end
+
+  local owncar = ac.getCar(0)
+  if not owncar or not owncar.position then return end
+  
+  -- Configuration for the visual gates
+  local GATE_HEIGHT = 0.5 -- NEW: Much smaller height for thin strips (in meters)
+  local COL_START_FINISH = rgbm(0.2, 0.8, 0.2, 0.6) -- Green (slightly less transparent)
+  local COL_NEXT_GATE    = rgbm(0.8, 0.8, 0.2, 0.8) -- Yellow (less transparent)
+  local COL_NORMAL_GATE  = rgbm(0.4, 0.6, 1.0, 0.5) -- Blue (less transparent)
+
+  local car_pos = owncar.position
+  local next_gate_to_cross = last_gate_crossed_index + 1
+
+  for i, gate in ipairs(current_route.gates) do
+    local color = COL_NORMAL_GATE
+    if i == 1 then
+      color = COL_START_FINISH
+    elseif i == next_gate_to_cross then
+      color = COL_NEXT_GATE
+    end
+
+    -- NEW SIMPLIFIED LOGIC:
+    -- Use the car's current Y-position as the base for all gates.
+    local ground_y = car_pos.y
+
+    -- Define the 4 corners of the rectangular plane using the new height
+    local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)       -- Bottom-Left
+    local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)       -- Bottom-Right
+    local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z) -- Top-Right
+    local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z) -- Top-Left
+
+    -- Draw the quad
+    render.quad(corner_bl, corner_br, corner_tr, corner_tl, color)
+  end
+end
+
+-- NEW RENDER HOOK for drawing in the 3D world
+-- This is the correct way to draw objects in the game scene.
+render.on('main.root.transparent', function()
+  -- This function is called every frame during the 3D rendering phase.
+  
+  -- We check our setting here. If it's enabled, we call the drawing function.
+  if settings.showDebugGates then
+    
+    -- THE FIX:
+    -- 1. Enable depth testing so our gates render behind solid objects.
+    render.setDepthMode(render.DepthMode.ReadOnlyLessEqual)
+
+    -- 2. Call our drawing function as before.
+    drawDebugGates()
+
+    -- 3. IMPORTANT: Reset the depth mode to default so we don't break other rendering.
+    render.setDepthMode(render.DepthMode.Default)
+
+  end
+end)
+
 
 
 local DeltaFont = ui.DWriteFont('Arial', './data')
@@ -887,6 +947,10 @@ function windowMain(dt)
     local rounding =0.0 
     
     ui.drawRectFilled(p1, p2, col, rounding)
+  end
+
+  if settings.showDebugGates then
+    drawDebugGates()
   end
 
   checkGateCrossing(dt)
@@ -1104,6 +1168,10 @@ function windowSettings(dt)
       end
     end)
     ui.tabItem("Route Editor", function()
+      if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
+    settings.showDebugGates = not settings.showDebugGates
+  end
+  ui.separator()
       drawGateEditor()
     end)
   end)
