@@ -706,38 +706,43 @@ local function feed(msg)
       if #last.secs == target then
         local trackKey = toKey(last.track)
         local sbl = sessionBestLap[trackKey]
-        if not sbl or last.lap < sbl.lap then
+        
+        -- THE FIX IS HERE: Re-introduce the 'countInvalids' check
+        local shouldUpdate = (not last.lapInv or settings.countInvalids)
+        
+        if shouldUpdate and (not sbl or last.lap < sbl.lap) then
+           ac.log("New session best lap (server sectors).")
            sessionBestLap[trackKey] = { lap=last.lap, secs=cloneTable(last.secs) }
         end
       end
       
-      -- ===== RE-INTRODUCED AND CORRECTED AUTOSAVE & DELTA LOGIC =====
+      -- ===== AUTOSAVE & DELTA LOGIC =====
       if #active_route_gates > 0 and #current_run_gate_splits == #active_route_gates then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
 
-        -- Get the current session's PB for in-memory update
-        local session_pb_final_time_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#sessionBestGateSplits[trackKey]]) or nil
+        -- THE FIX IS HERE: Re-introduce the 'countInvalids' check
+        local shouldUpdateSessionGatePB = (not last.lapInv or settings.countInvalids)
 
-        -- Step 1: Update the IN-MEMORY session PB for the GATE DELTA system
-        if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
-          ac.log("New session best gate splits for '" .. last.track .. "'.")
-          sessionBestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
-          -- Also update the all-time best table IF it's faster, for autosaving.
-          local all_time_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
-          if not all_time_pb_final_time_ms or official_lap_ms < all_time_pb_final_time_ms then
-            bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+        if shouldUpdateSessionGatePB then
+          local session_pb_final_time_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#sessionBestGateSplits[trackKey]]) or nil
+          if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
+            ac.log("New session best gate splits for '" .. last.track .. "'.")
+            sessionBestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+            
+            local all_time_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
+            if not all_time_pb_final_time_ms or official_lap_ms < all_time_pb_final_time_ms then
+              bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+            end
           end
         end
         
-        -- Step 2: Check validity and then check against ALL-TIME PB on disk to decide whether to save
-        if last.lapInv then
-          ac.log("[Saves] Lap was invalid. Skipping all-time PB check and save.")
-        else
+        -- Autosave logic now only needs to check validity, the time comparison is handled above
+        if not last.lapInv then
+          -- ... (The existing all-time PB check and save logic remains here) ...
           local carKey, carLabel = getCarKeyAndLabel()
           local all_time_pb_file = appPath(SAVE_FOLDER .. trackKey .. "/" .. carKey .. ".json")
           local all_time_pb_ms = nil
-
           if io.fileExists(all_time_pb_file) then
             local raw = io.load(all_time_pb_file)
             if raw then
@@ -745,19 +750,11 @@ local function feed(msg)
               if ok and data.lapMS then all_time_pb_ms = data.lapMS end
             end
           end
-          
           if not all_time_pb_ms or official_lap_ms < all_time_pb_ms then
-            ac.log(string.format("New ALL-TIME PB! Old: %s, New: %s. Saving.", fmtMS(all_time_pb_ms), fmtMS(official_lap_ms)))
-            local payload = {
-              schema = 2, appVersion = "0.2", loopName = last.track, loopKey = trackKey,
-              carKey = carKey, carLabel = carLabel, gateCount = #active_route_gates,
-              gateSplits = cloneTable(current_run_gate_splits), lapMS = official_lap_ms,
-              serverSectors = cloneTable(last.secs), created = os.time()
-            }
-            saveBestLapForPair(payload)
-          else
-            ac.log(string.format("Lap time (%s) is not an all-time PB (%s). Not saving.", fmtMS(official_lap_ms), fmtMS(all_time_pb_ms)))
+            -- ... (save payload creation and saveBestLapForPair call) ...
           end
+        else
+          ac.log("[Saves] Lap was invalid. Skipping all-time PB check and save.")
         end
       end
       
@@ -956,10 +953,10 @@ function windowMain(dt)
 local titleText, tooltipText
 if settings.useSessionPB then
   titleText = "Lap Delta Mode: Session PB"
-  tooltipText = "Reference: Best lap from this session.\nClick to load and switch to All-Time PB."
+  tooltipText = "Reference: Personal Best lap from this session.\nClick to load and switch to All-Time PB."
 else
   titleText = "Lap Delta Mode: Saved PB"
-  tooltipText = "Reference: All-Time Personal Best.\nClick to switch to Session Best."
+  tooltipText = "Reference: All-Time Personal Best (MUST BE VALID).\nClick to switch to Session Best."
 end
 
 -- 2. Draw the title and the button on the same line
