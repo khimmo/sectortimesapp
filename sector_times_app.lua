@@ -82,6 +82,7 @@ local lap_start_to_gate_1_timer = -1.0
 
 -- NEW STATE FOR THE DELTA SYSTEM
 local bestGateSplits = {}             -- { [trackKey] = {<time1>, <time2>, ...} } Stores the PB gate times for all routes
+local sessionBestGateSplits = {}
 local active_gate_pb = {}             -- The frozen PB splits for the current lap
 local current_run_gate_splits = {}    -- The gate times for the lap currently in progress
 local ui_gate_delta_text = "Current Lap Delta: -.--"
@@ -317,8 +318,18 @@ local function startNewGateLap(trackName)
 
   -- This is the same logic from the 'feed' function's lap start hook
   local trackKey = toKey(trackName)
-  bestGateSplits[trackKey] = bestGateSplits[trackKey] or {}
-  active_gate_pb = bestGateSplits[trackKey]
+
+  if settings.useSessionPB then
+    ac.log("Mode: Session PB. Using session data for live delta.")
+    -- Ensure the table exists for this track, but it might be empty (which is correct for the first lap)
+    sessionBestGateSplits[trackKey] = sessionBestGateSplits[trackKey] or {}
+    active_gate_pb = sessionBestGateSplits[trackKey]
+  else
+    ac.log("Mode: Saved PB. Using all-time data for live delta.")
+    bestGateSplits[trackKey] = bestGateSplits[trackKey] or {}
+    active_gate_pb = bestGateSplits[trackKey]
+  end
+
   ac.log("Loaded " .. #active_gate_pb .. " PB gate splits.")
 
   -- Reset all gate-related states for the new lap
@@ -706,12 +717,17 @@ local function feed(msg)
         local official_lap_ms = last.lap * 1000
 
         -- Get the current session's PB for in-memory update
-        local session_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
+        local session_pb_final_time_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#sessionBestGateSplits[trackKey]]) or nil
 
         -- Step 1: Update the IN-MEMORY session PB for the GATE DELTA system
         if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
           ac.log("New session best gate splits for '" .. last.track .. "'.")
-          bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+          sessionBestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+          -- Also update the all-time best table IF it's faster, for autosaving.
+          local all_time_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
+          if not all_time_pb_final_time_ms or official_lap_ms < all_time_pb_final_time_ms then
+            bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
+          end
         end
         
         -- Step 2: Check validity and then check against ALL-TIME PB on disk to decide whether to save
