@@ -6,6 +6,7 @@
 local json = require('json')
 
 local defaults = {
+  useSessionPB    = true,
   showDebugGates  = false,
   showBackground  = true,
   countInvalids   = false,   -- include invalid sectors/laps in PBs?
@@ -20,6 +21,7 @@ local gate_editor_active = false -- a flag to know when to draw gates on a map (
 local current_route = { name = "", gates = {} }
 local GATE_WIDTH = 30.0 -- Default gate width in meters
 local gate_debounce_timer = 0.0
+
 
 -- NEW: State for automatic gate placement
 local auto_placement_active = false
@@ -76,6 +78,7 @@ local last_gate_crossed_index = 0   -- Which gate we last crossed
 local last_pos = nil                -- The car's position on the previous frame
 local manual_lap_timer = 0.0
 local gate_debounce_timer = 0.0
+local lap_start_to_gate_1_timer = -1.0
 
 -- NEW STATE FOR THE DELTA SYSTEM
 local bestGateSplits = {}             -- { [trackKey] = {<time1>, <time2>, ...} } Stores the PB gate times for all routes
@@ -89,14 +92,16 @@ local live_delta_value = nil   -- number (e.g., -0.25) ((NOT USED ANYMORE))
 local live_delta_color = nil   -- rgbm (green/yellow) chosen in gate logic ((NOT USED ANYMORE))
 
 -- Session references
--- bestSecs[trackKey].secs[i] = best time for sector i (session)
--- bestLap[trackKey]          = { lap=<time>, secs={...} } fastest complete lap (session)
+
 local bestSecs, bestLap = {}, {}
+local sessionBestSecs, sessionBestLap = {}, {}
 
 -- Snapshot used for CURRENT LAP deltas & PB brackets (frozen on lap start, refreshed after lap completion)
 -- activePB = { secs={...}, lap=<time>, theoretical=<bool> }
 local activePB = { secs={}, lap=nil, theoretical=false }
 local lastRefToggle = settings.refBestSectors
+
+local _saved_pbs_loaded = false
 
 -- ===== Saving system (per loop + car) =====
 
@@ -321,6 +326,7 @@ local function startNewGateLap(trackName)
   last_pos = nil 
   manual_lap_timer = 0.0
   gate_debounce_timer = 0.0
+  lap_start_to_gate_1_timer = 0.0
   current_run_gate_splits = {}
   
   -- Set the UI to its initial state
@@ -374,52 +380,46 @@ local function lines_intersect(p1, p2, p3, p4)
   return t > 0 and t < 1 and u > 0 and u < 1
 end
 
--- This is our new per-frame update function, which CSP will call.
+-- REVISED AND ROBUST GATE CROSSING LOGIC (WITH VALIDATION DEBUGGING)
 local function checkGateCrossing(dt)
-  -- ===== AUTO-PLACEMENT LOGIC (RE-INTEGRATED) =====
+  -- ===== AUTO-PLACEMENT LOGIC (unchanged) =====
   if auto_placement_active then
-    -- Increment the timer
     auto_placement_timer = auto_placement_timer + dt
-    
-    
     if auto_placement_timer >= settings.auto_placement_interval then
-      auto_placement_timer = 0.0 -- Reset the timer
-      
+      auto_placement_timer = 0.0
       local owncar = ac.getCar(0)
       if owncar and owncar.position then
         local car_pos = owncar.position
         local forward_vec2 = vec2(owncar.look.x, owncar.look.z):normalize()
         local side_vec2 = vec2(-forward_vec2.y, forward_vec2.x)
-        
-        local half_width = GATE_WIDTH / 2.0
-        
-        local point_a_vec2 = vec2(car_pos.x, car_pos.z) + side_vec2 * half_width
-        local point_b_vec2 = vec2(car_pos.x, car_pos.z) - side_vec2 * half_width
-        
         local new_gate = {
-          p1 = { x = point_a_vec2.x, z = point_a_vec2.y },
-          p2 = { x = point_b_vec2.x, z = point_b_vec2.y }
+          p1 = { x = car_pos.x - side_vec2.x * (GATE_WIDTH / 2), z = car_pos.z - side_vec2.y * (GATE_WIDTH / 2) },
+          p2 = { x = car_pos.x + side_vec2.x * (GATE_WIDTH / 2), z = car_pos.z + side_vec2.y * (GATE_WIDTH / 2) }
         }
         table.insert(current_route.gates, new_gate)
-        ac.log("Auto-placed Gate #" .. #current_route.gates .. " for route '" .. current_route.name .. "'.")
+        ac.log("Auto-placed Gate #" .. #current_route.gates)
       end
     end
-    
-    return -- IMPORTANT: Stop the function here so it doesn't try to time laps while placing gates
+    return
   end
   -- ==========================================================
 
-  -- The rest of the timing logic is below, and will not run if auto_placement_active is true.
+  -- Increment our new timer if it's active
+  if lap_start_to_gate_1_timer >= 0 then
+    lap_start_to_gate_1_timer = lap_start_to_gate_1_timer + dt
+  end
+
   gate_debounce_timer = math.max(0, gate_debounce_timer - dt)
-  
   if #current_route.gates == 0 then return end
 
   local owncar = ac.getCar(0)
   if not owncar or not owncar.position then return end
   local current_pos_vec3 = owncar.position
   
-  manual_lap_timer = manual_lap_timer + dt
-
+  if last_gate_crossed_index > 0 or lap_start_to_gate_1_timer >= 0 then
+    manual_lap_timer = manual_lap_timer + dt
+  end
+  
   if not last_pos then
     last_pos = {x = current_pos_vec3.x, y = current_pos_vec3.y, z = current_pos_vec3.z}
     return
@@ -430,10 +430,10 @@ local function checkGateCrossing(dt)
   
   local found_gate_index = -1
 
-  -- 1. SEARCH WINDOW LOGIC: Always look for the next 3 gates.
   for i = next_gate_index, math.min(next_gate_index + 2, #current_route.gates) do
     local gate_to_check = current_route.gates[i]
     
+    -- RE-ADD THE MISSING CALCULATIONS FOR side_last AND side_current
     local gate_p1 = gate_to_check.p1; local gate_p2 = gate_to_check.p2
     local gate_vec = {x = gate_p2.x - gate_p1.x, z = gate_p2.z - gate_p1.z}
     local vec_to_last = {x = last_pos.x - gate_p1.x, z = last_pos.z - gate_p1.z}
@@ -442,44 +442,52 @@ local function checkGateCrossing(dt)
     local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
     
     if (side_last * side_current <= 0) and (gate_debounce_timer == 0) then
-      found_gate_index = i
-      break
+      if (side_last < 0 and side_current >= 0) then
+        ac.log(string.format("[Gate #%d] CROSSED FROM CORRECT SIDE. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
+        found_gate_index = i
+        break
+      else
+        ac.log(string.format("[Gate #%d] CROSSED FROM WRONG SIDE. Ignored. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
+      end
     end
   end
   
-  -- 2. GATE PROCESSING LOGIC: Run this block if we found a gate.
   if found_gate_index ~= -1 then
+    gate_debounce_timer = 0.1
+    local total_time_ms
+
     if found_gate_index == 1 then
-      startNewGateLap(current_route.name)
+      ac.log("Gate 1 crossed. Capturing Split Zero.")
+      local split_zero_time_ms = lap_start_to_gate_1_timer * 1000
+      lap_start_to_gate_1_timer = -1.0
+      manual_lap_timer = 0.0
+      table.insert(current_run_gate_splits, split_zero_time_ms)
+      total_time_ms = split_zero_time_ms
+    else
+      local split_zero_time_ms = current_run_gate_splits[1] or 0
+      total_time_ms = split_zero_time_ms + (manual_lap_timer * 1000)
+      table.insert(current_run_gate_splits, total_time_ms)
     end
     
-    local lapTimeMS = manual_lap_timer * 1000
-    ac.log("Gate " .. found_gate_index .. " crossed.")
-    gate_debounce_timer = 0.1
-    table.insert(current_run_gate_splits, lapTimeMS)
-
-    local pb_split = active_gate_pb[found_gate_index]
-    if pb_split then
-      local delta = (lapTimeMS - pb_split) / 1000.0
+    ac.log("Gate " .. found_gate_index .. " triggered. Total Time: " .. fmtMS(total_time_ms))
+    
+    local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
+    if pb_split_total_time then
+      local delta = (total_time_ms - pb_split_total_time) / 1000.0
       ui_gate_delta_text = string.format("Current Lap Delta: %+.2f", delta)
       if delta < 0 then ui_gate_delta_color = COL_GREEN else ui_gate_delta_color = COL_YELLOW end
-      
-      -- NEW: Update the state for the separate delta window
       live_delta_value = delta
-      live_delta_color = ui_gate_delta_color -- Reuse the color we just calculated
+      live_delta_color = ui_gate_delta_color
     else
-      ui_gate_delta_text = string.format("Current Lap Delta: %+.2f", 0.0)
+      ui_gate_delta_text = "Current Lap Delta: -.--"
       ui_gate_delta_color = nil
-      
-      -- NEW: Update the separate delta window state (no PB to compare against yet)
-      live_delta_value = 0.0
+      live_delta_value = nil
       live_delta_color = nil
     end
     
     last_gate_crossed_index = found_gate_index
   else
-    -- 3. OFF-ROUTE RESET LOGIC: This only runs if NO gate was found in the search window.
-    if last_gate_crossed_index > 0 then -- Only check if a lap is in progress
+    if last_gate_crossed_index > 0 then
       local primary_gate_to_check = current_route.gates[next_gate_index]
       local gate_center_x = (primary_gate_to_check.p1.x + primary_gate_to_check.p2.x) / 2
       local gate_center_z = (primary_gate_to_check.p1.z + primary_gate_to_check.p2.z) / 2
@@ -491,10 +499,9 @@ local function checkGateCrossing(dt)
         current_run_gate_splits = {}
         ui_gate_delta_text = "Current Lap Delta: -.--"
         ui_gate_delta_color = nil
-
-        -- NEW: Also reset the separate delta window's state
         live_delta_value = nil
         live_delta_color = nil
+        lap_start_to_gate_1_timer = -1.0 -- Also stop the split zero timer
       end
     end
   end
@@ -579,45 +586,26 @@ local function snapshotActivePB(trackName)
   local key = toKey(trackName or "")
   activePB = { secs={}, lap=nil, theoretical=false }
 
-  if settings.refBestSectors then
-  -- fastest individual sectors (theoretical)
-  local src = bestSecs[key] and bestSecs[key].secs or {}
-  local targetCount = sectorCountFor(trackName)
-  local complete = true
-  local total = 0
+  -- Determine which data source to use based on the toggle
+  local sourceBestLap
+  if settings.useSessionPB then
+    sourceBestLap = sessionBestLap[key]
+  else
+    sourceBestLap = bestLap[key]
+  end
 
-  for i=1,targetCount do
-    local v = src[i]
-    if v then
+  -- We are no longer using the "theoretical best" logic for simplicity with this new system.
+  -- The reference is always the fastest complete lap from the chosen source.
+
+  if sourceBestLap and sourceBestLap.secs then
+    for i, v in ipairs(sourceBestLap.secs) do
       activePB.secs[i] = v
-      total = total + v
-    else
-      complete = false
-      activePB.secs[i] = nil
     end
-  end
-
-  if complete then
-    activePB.lap = total
-    activePB.theoretical = true
+    activePB.lap = sourceBestLap.lap
+    activePB.theoretical = false -- It's always a real lap now
   else
-    -- don’t set lap if not all sectors available
-    activePB.lap = nil
-    activePB.theoretical = false
-  end
-  else
-    -- fastest complete lap (fallback to bestSecs if none yet)
-    local bl = bestLap[key]
-    if bl and bl.secs then
-      for i,v in ipairs(bl.secs) do activePB.secs[i]=v end
-      activePB.lap = bl.lap
-      activePB.theoretical = false
-    else
-      local src = bestSecs[key] and bestSecs[key].secs or {}
-      for i,v in ipairs(src) do activePB.secs[i]=v end
-      if #activePB.secs>0 then activePB.lap = sum(activePB.secs) end
-      activePB.theoretical = true
-    end
+    -- If there's no reference from the chosen source, the UI will be blank.
+    -- This is the correct behavior (e.g., Session PB mode at the start of a session).
   end
 end
 
@@ -689,56 +677,47 @@ local function feed(msg)
       local lapT  = (tonumber(m) or 0)*60 + (tonumber(s) or 0)
       current.lap, current.lapInv = lapT, lapInvalidFromServer
       local target = sectorCountFor(current.track)
-      local priorInvalid = anyTrue(current.inv, math.max(0, target-1))
-
+      -- [ logic for calculating final sector, etc. ]
       if #current.secs < target and #current.secs >= 1 then
         local computed = math.max(0, lapT - sum(current.secs))
-        local finalInv = priorInvalid or lapInvalidFromServer
+        local finalInv = anyTrue(current.inv, target-1) or lapInvalidFromServer
         current.secs[target] = computed
         current.inv[target]  = finalInv
-        local updated = updBestSector(toKey(current.track), target, computed, finalInv)
-        if updated then current.pbNew[target] = true end
+        updBestSector(toKey(current.track), target, computed, finalInv)
       elseif #current.secs == target then
-        local finalInv = (current.inv[target] or false) or priorInvalid or lapInvalidFromServer
-        current.inv[target] = finalInv
+        current.inv[target] = (current.inv[target] or false) or anyTrue(current.inv, target-1) or lapInvalidFromServer
       else
         for i=target+1,#current.secs do current.secs[i]=nil; current.inv[i]=nil; current.pbNew[i]=nil end
       end
 
-      -- === CORRECT ORDER OF OPERATIONS ===
+      -- === NEW LOGIC: ALWAYS UPDATE SESSION PB ===
       last = cloneLap(current)
       if #last.secs == target then
-        updBestLap(toKey(last.track), last.lap, last.secs, last.lapInv)
+        local trackKey = toKey(last.track)
+        local sbl = sessionBestLap[trackKey]
+        if not sbl or last.lap < sbl.lap then
+           sessionBestLap[trackKey] = { lap=last.lap, secs=cloneTable(last.secs) }
+        end
       end
       
-      -- REVISED AUTOMATIC SAVE LOGIC --
+      -- ===== RE-INTRODUCED AND CORRECTED AUTOSAVE & DELTA LOGIC =====
       if #active_route_gates > 0 and #current_run_gate_splits == #active_route_gates then
-        
-        local official_lap_ms = last.lap * 1000
         local trackKey = toKey(last.track)
-        
+        local official_lap_ms = last.lap * 1000
+
         -- Get the current session's PB for in-memory update
-        local session_pb_final_time_ms = nil
-        local session_pb_splits = bestGateSplits[trackKey]
-        if session_pb_splits and session_pb_splits.lapMS then
-          session_pb_final_time_ms = session_pb_splits.lapMS
-        end
+        local session_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
 
-        -- Step 1: Update the IN-MEMORY session PB if this lap is the best for this session
-        -- This happens REGARDLESS of lap validity. An invalid lap can still be a session PB.
+        -- Step 1: Update the IN-MEMORY session PB for the GATE DELTA system
         if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
-          ac.log("New session best splits for '" .. last.track .. "'.")
-          local session_pb_data = cloneTable(current_run_gate_splits)
-          session_pb_data.lapMS = official_lap_ms
-          session_pb_data.serverSectors = cloneTable(last.secs) -- also store server sectors for the session PB
-          bestGateSplits[trackKey] = session_pb_data
+          ac.log("New session best gate splits for '" .. last.track .. "'.")
+          bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
         end
-
-        -- Step 2: Check if the lap is valid. If not, STOP here and do not save to disk.
+        
+        -- Step 2: Check validity and then check against ALL-TIME PB on disk to decide whether to save
         if last.lapInv then
           ac.log("[Saves] Lap was invalid. Skipping all-time PB check and save.")
         else
-          -- Step 3: Check against the ALL-TIME PB on disk to decide whether to save
           local carKey, carLabel = getCarKeyAndLabel()
           local all_time_pb_file = appPath(SAVE_FOLDER .. trackKey .. "/" .. carKey .. ".json")
           local all_time_pb_ms = nil
@@ -747,34 +726,21 @@ local function feed(msg)
             local raw = io.load(all_time_pb_file)
             if raw then
               local ok, data = pcall(json.decode, raw)
-              if ok and data.lapMS then
-                all_time_pb_ms = data.lapMS
-              end
+              if ok and data.lapMS then all_time_pb_ms = data.lapMS end
             end
           end
           
-          -- Step 4: Compare and Save ONLY if the OFFICIAL server time is a valid all-time best
           if not all_time_pb_ms or official_lap_ms < all_time_pb_ms then
-            ac.log(string.format("New ALL-TIME PB! Old: %s, New: %s. Saving.", 
-              fmtMS(all_time_pb_ms), fmtMS(official_lap_ms)))
-              
+            ac.log(string.format("New ALL-TIME PB! Old: %s, New: %s. Saving.", fmtMS(all_time_pb_ms), fmtMS(official_lap_ms)))
             local payload = {
-              schema = 2,
-              appVersion = "0.2",
-              loopName = last.track,
-              loopKey = trackKey,
-              carKey = carKey,
-              carLabel = carLabel,
-              gateCount = #active_route_gates,
-              gateSplits = cloneTable(current_run_gate_splits),
-              lapMS = official_lap_ms,
-              serverSectors = cloneTable(last.secs),
-              created = os.time()
+              schema = 2, appVersion = "0.2", loopName = last.track, loopKey = trackKey,
+              carKey = carKey, carLabel = carLabel, gateCount = #active_route_gates,
+              gateSplits = cloneTable(current_run_gate_splits), lapMS = official_lap_ms,
+              serverSectors = cloneTable(last.secs), created = os.time()
             }
             saveBestLapForPair(payload)
           else
-            ac.log(string.format("Lap time (%s) is not an all-time PB (%s). Not saving.",
-              fmtMS(official_lap_ms), fmtMS(all_time_pb_ms)))
+            ac.log(string.format("Lap time (%s) is not an all-time PB (%s). Not saving.", fmtMS(official_lap_ms), fmtMS(all_time_pb_ms)))
           end
         end
       end
@@ -783,7 +749,6 @@ local function feed(msg)
       current = newLapState()
       current.track = trackName
       snapshotActivePB(trackName)
-      -- ==================================
       
       return
     end
@@ -927,12 +892,20 @@ render.on('main.root.transparent', function()
   end
 end)
 
+-- HELPER for adding a tooltip to the previous UI item
+local function setTooltipOnHover(text)
+  if ui.itemHovered() then
+    ui.setTooltip(text)
+  end
+end
 
 
 local DeltaFont = ui.DWriteFont('Arial', './data')
     :weight(ui.DWriteFont.Weight.Bold)
     :style(ui.DWriteFont.Style.Normal)
     :stretch(ui.DWriteFont.Stretch.Normal)
+
+    
 
 function windowMain(dt)
   -- RUN OUR PER-FRAME GATE LOGIC
@@ -961,12 +934,47 @@ function windowMain(dt)
     snapshotActivePB(current.track ~= "" and current.track or last.track or "")
   end
 
-  -- ===== DELTA DISPLAY (Standard Font, WITH COLOR) =====
+ -- ===== DELTA DISPLAY (WITH ON-DEMAND LOADING) =====
 
-  -- Title text
-  ui.text("Current Lap Delta")
+-- 1. Determine the title and tooltip text based on the current mode
+local titleText, tooltipText
+if settings.useSessionPB then
+  titleText = "Lap Delta Mode: Session PB"
+  tooltipText = "Reference: Best lap from this session.\nClick to load and switch to All-Time PB."
+else
+  titleText = "Lap Delta Mode: Saved PB"
+  tooltipText = "Reference: All-Time Personal Best.\nClick to switch to Session Best."
+end
 
-  -- Ensure our font exists (created once, reused after)
+-- 2. Draw the title and the button on the same line
+ui.text(titleText)
+ui.sameLine()
+
+-- 3. Create the button with the new on-demand loading logic
+if ui.iconButton('toggle_icon.png', vec2(20, 20), nil, nil, 0) then
+  -- If we are switching TO Saved PB mode...
+  if settings.useSessionPB == true then
+    -- ...and we haven't loaded the PBs yet this session...
+    if not _saved_pbs_loaded then
+      ac.log("[Saves] Loading PBs on-demand from main UI button.")
+      local ok, err = loadAllPBsForCar()
+      if ok then
+        _saved_pbs_loaded = true -- Mark PBs as loaded for this session
+      else
+        ac.log("[Saves] On-demand load failed: " .. tostring(err))
+      end
+    end
+  end
+
+  -- Flip the setting regardless of whether the load succeeded
+  settings.useSessionPB = not settings.useSessionPB
+  
+  -- Immediately update the UI to reflect the change
+  snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
+end
+setTooltipOnHover(tooltipText)
+
+  -- 4. The rest of the delta display logic remains the same
   DeltaFont = DeltaFont or ui.DWriteFont('Arial', './data')
       :weight(ui.DWriteFont.Weight.Bold)
       :style(ui.DWriteFont.Style.Normal)
@@ -978,7 +986,6 @@ function windowMain(dt)
 
   if live_delta_value ~= nil then
     local delta_text = string.format("%+.2f", live_delta_value)
--- Colour logic: yellow if positive, green if negative, white if 0
     local col
     if live_delta_value > 0 then
       col = rgbm(0.88, 0.79, 0.37, 1.0)  -- yellow
@@ -987,7 +994,6 @@ function windowMain(dt)
     else
       col = rgbm(1.0, 1.0, 1.0, 1.0)  -- white
     end
-
     ui.dwriteText(delta_text, deltaFontSize, col)
   else
     ui.dwriteText("-.--", deltaFontSize, rgbm(1, 1, 1, 1))
@@ -995,6 +1001,7 @@ function windowMain(dt)
   ui.popFont()
 
   ui.separator()
+  
   -- =======================================================
 
   -- CURRENT LAP (brackets + deltas)
@@ -1118,7 +1125,7 @@ function windowSettings(dt)
       --ui.text("Sector Times Settings")
       --ui.separator()
 
-      if ui.checkbox("Show Window Background", settings.showBackground) then
+      if ui.checkbox("Toggle App Background", settings.showBackground) then
     settings.showBackground = not settings.showBackground
   end
   --ui.separator()
@@ -1144,13 +1151,10 @@ function windowSettings(dt)
 
       --ui.separator()
       
-      if ui.button("Load PB times for this car") then
-        local ok, err = loadAllPBsForCar()
-        if not ok and err then ac.log("[Saves] Load failed: " .. tostring(err)) end
-      end
+      
 
       ui.sameLine()
-      if ui.button("Clear saved PB for this loop") then
+      if ui.button("Delete saved PB for this loop") then
         local loopKey = toKey(loopName)
         if loopKey ~= "" and carKey ~= "" and carKey ~= "unknown_car" then
           local pbFile = appPath(SAVE_FOLDER .. loopKey .. "/" .. carKey .. ".json")
