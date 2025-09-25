@@ -106,6 +106,25 @@ local _saved_pbs_loaded = false
 
 -- ===== Saving system (per loop + car) =====
 
+local function getServerTrafficType()
+  local serverName = ac.getServerName()
+
+  -- If we are offline or the name is empty, treat it as a no-traffic environment.
+  if not serverName or serverName == "" then
+    return "notraffic" -- Offline practice is always no traffic
+  end
+
+  local lowerServerName = serverName:lower()
+
+  -- Search for the keyword "traffic".
+  if lowerServerName:find("traffic", 1, true) then
+    return "traffic"
+  else
+    -- If the keyword isn't found, we assume it's a no-traffic server.
+    return "notraffic"
+  end
+end
+
 local function tlen(t) if type(t)=="table" then return #t else return 0 end end
 
 
@@ -123,12 +142,16 @@ local function saveBestLapForPair(payload)
     return false
   end
 
-  local loopDir = appPath(SAVE_FOLDER .. payload.loopKey .. "/")
+  -- 1. Determine the traffic type for the subfolder name
+  local trafficType = getServerTrafficType()
+
+  -- 2. Construct the full path including the new traffic subfolder
+  local loopDir = appPath(SAVE_FOLDER .. trafficType .. "/" .. payload.loopKey .. "/")
   local savePath = loopDir .. payload.carKey .. ".json"
 
-  ac.log(string.format("[Saves] New PB! Saving lap for '%s' / '%s'", payload.loopName, payload.carLabel))
+  ac.log(string.format("[Saves] New PB! Saving lap for '%s' / '%s' (Type: %s)", payload.loopName, payload.carLabel, trafficType))
 
-  -- Ensure the loop's directory exists
+  -- Ensure the loop's directory exists (io.createDir is recursive)
   if not io.dirExists(loopDir) then
     io.createDir(loopDir)
     ac.log("[Saves] Created new directory: " .. loopDir)
@@ -139,7 +162,6 @@ local function saveBestLapForPair(payload)
   ac.log("[Saves] Saved file to: " .. savePath)
   return true
 end
-
 
 local function getCarKeyAndLabel()
   local function try(fn, ...)
@@ -228,33 +250,35 @@ local function loadAllPBsForCar()
     return false, "Could not identify the current car."
   end
   
-  ac.log(string.format("[Saves] Scanning for all PBs for car: %s (%s)", carLabel, carKey))
+  -- 1. Determine which subfolder to load from
+  local trafficType = getServerTrafficType()
+  ac.log(string.format("[Saves] Scanning for PBs for car: %s (%s) | Server Type: %s", carLabel, carKey, trafficType))
 
-  -- Step 1: Get all subdirectories in the 'savedtimes' folder.
-  local saveDir = appPath(SAVE_FOLDER)
-  if not io.dirExists(saveDir) then
-    ac.log("[Saves] Save folder does not exist yet. Nothing to load.")
-    return false, "Save folder does not exist yet."
+  -- 2. Define the specific directory to scan
+  local specificSaveDir = appPath(SAVE_FOLDER .. trafficType .. "/")
+
+  if not io.dirExists(specificSaveDir) then
+    ac.log("[Saves] Save folder for this traffic type does not exist yet. Nothing to load.")
+    return false, "No PBs found for this server type."
   end
 
-  -- Use io.scanDir and filter for directories to get our loop keys
+  -- Use io.scanDir to get our loop keys from the specific traffic folder
   local loopDirs = {}
-  io.scanDir(saveDir, '*', function(entryName, attributes)
+  io.scanDir(specificSaveDir, '*', function(entryName, attributes)
     if attributes.isDirectory then
       table.insert(loopDirs, entryName)
     end
   end)
 
   if #loopDirs == 0 then
-    ac.log("[Saves] No loop directories found in 'savedtimes'. Nothing to load.")
-    return false, "No saved PBs found for this car."
+    ac.log("[Saves] No loop folders found in '"..trafficType.."' directory. Nothing to load.")
+    return false, "No saved PBs found for this car on this server type."
   end
   ac.log("[Saves] Found " .. #loopDirs .. " possible loop folders. Checking for saved PBs...")
 
-  -- Step 2: Iterate through the found loop directories and check for a corresponding PB file.
   local loadedCount = 0
   for _, loopKey in ipairs(loopDirs) do
-    local pbFile = saveDir .. loopKey .. "/" .. carKey .. ".json"
+    local pbFile = specificSaveDir .. loopKey .. "/" .. carKey .. ".json"
     if io.fileExists(pbFile) then
       local raw = io.load(pbFile)
       if raw then
@@ -262,13 +286,13 @@ local function loadAllPBsForCar()
         if ok and type(lapData) == 'table' then
           local currentLoopKey = lapData.loopKey or loopKey
 
-          -- A. Load Gate Splits (for delta timing)
+          -- Load Gate Splits (for delta timing)
           if type(lapData.gateSplits) == 'table' then
             lapData.gateSplits.lapMS = lapData.lapMS
             bestGateSplits[currentLoopKey] = cloneTable(lapData.gateSplits)
           end
           
-          -- B. Load Server Sector Times (for UI display)
+          -- Load Server Sector Times (for UI display)
           if type(lapData.serverSectors) == 'table' and lapData.lapMS then
             bestLap[currentLoopKey] = {
               lap = lapData.lapMS / 1000,
@@ -287,7 +311,7 @@ local function loadAllPBsForCar()
   end
 
   if loadedCount == 0 then
-    return false, "No saved PBs found for this car."
+    return false, "No saved PBs found for this car on this server type."
   end
 
   -- Refresh the active PB for the current loop, if one was just loaded
@@ -311,7 +335,18 @@ end
 --local function toKey(name) return (name or ""):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
 
 local function startNewGateLap(trackName)
-  ac.log("Starting new gate lap for: " .. trackName)
+  -- Get the current server traffic type
+  local trafficType = getServerTrafficType()
+  -- Create a user-friendly version for the log message
+  local displayType = "Unknown"
+  if trafficType == "traffic" then
+    displayType = "Traffic"
+  elseif trafficType == "notraffic" then
+    displayType = "No Traffic"
+  end
+
+  -- THE MODIFIED LINE: Include the traffic type in the log message
+  ac.log(string.format("Starting new gate lap for: %s [%s]", trackName, displayType))
   
   -- The active gates are now taken from the globally loaded 'current_route'
   active_route_gates = current_route.gates
@@ -392,6 +427,7 @@ local function lines_intersect(p1, p2, p3, p4)
 end
 
 -- REVISED AND ROBUST GATE CROSSING LOGIC (WITH VALIDATION DEBUGGING)
+-- REVISED AND ROBUST GATE CROSSING LOGIC (WITH CLEANER DEBUGGING)
 local function checkGateCrossing(dt)
   -- ===== AUTO-PLACEMENT LOGIC (unchanged) =====
   if auto_placement_active then
@@ -415,7 +451,6 @@ local function checkGateCrossing(dt)
   end
   -- ==========================================================
 
-  -- Increment our new timer if it's active
   if lap_start_to_gate_1_timer >= 0 then
     lap_start_to_gate_1_timer = lap_start_to_gate_1_timer + dt
   end
@@ -444,7 +479,6 @@ local function checkGateCrossing(dt)
   for i = next_gate_index, math.min(next_gate_index + 2, #current_route.gates) do
     local gate_to_check = current_route.gates[i]
     
-    -- RE-ADD THE MISSING CALCULATIONS FOR side_last AND side_current
     local gate_p1 = gate_to_check.p1; local gate_p2 = gate_to_check.p2
     local gate_vec = {x = gate_p2.x - gate_p1.x, z = gate_p2.z - gate_p1.z}
     local vec_to_last = {x = last_pos.x - gate_p1.x, z = last_pos.z - gate_p1.z}
@@ -454,7 +488,7 @@ local function checkGateCrossing(dt)
     
     if (side_last * side_current <= 0) and (gate_debounce_timer == 0) then
       if (side_last < 0 and side_current >= 0) then
-        ac.log(string.format("[Gate #%d] CROSSED FROM CORRECT SIDE. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
+        -- THIS IS THE CHANGE: The "Correct Side" log message has been removed.
         found_gate_index = i
         break
       else
@@ -464,6 +498,19 @@ local function checkGateCrossing(dt)
   end
   
   if found_gate_index ~= -1 then
+    -- NEW: SKIPPED GATE DETECTION LOGIC
+    local expected_gate = last_gate_crossed_index + 1
+    if found_gate_index > expected_gate then
+      local first_skipped = expected_gate
+      local last_skipped = found_gate_index - 1
+      if first_skipped == last_skipped then
+        ac.log(string.format("[Gate Logic] SKIPPED Gate #%d. Crossed #%d instead.", first_skipped, found_gate_index))
+      else
+        ac.log(string.format("[Gate Logic] SKIPPED Gates #%d through #%d. Crossed #%d instead.", first_skipped, last_skipped, found_gate_index))
+      end
+    end
+    -- END NEW LOGIC
+
     gate_debounce_timer = 0.1
     local total_time_ms
 
@@ -512,7 +559,7 @@ local function checkGateCrossing(dt)
         ui_gate_delta_color = nil
         live_delta_value = nil
         live_delta_color = nil
-        lap_start_to_gate_1_timer = -1.0 -- Also stop the split zero timer
+        lap_start_to_gate_1_timer = -1.0
       end
     end
   end
@@ -716,48 +763,61 @@ local function feed(msg)
         end
       end
       
-      -- ===== AUTOSAVE & DELTA LOGIC =====
-      if #active_route_gates > 0 and #current_run_gate_splits == #active_route_gates then
+      -- ===== AUTOSAVE & DELTA LOGIC (FINAL, CORRECTED VALIDITY) =====
+      if #active_route_gates > 0 then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
-
-        -- THE FIX IS HERE: Re-introduce the 'countInvalids' check
-        local shouldUpdateSessionGatePB = (not last.lapInv or settings.countInvalids)
-
-        if shouldUpdateSessionGatePB then
-          local session_pb_final_time_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#sessionBestGateSplits[trackKey]]) or nil
-          if not session_pb_final_time_ms or official_lap_ms < session_pb_final_time_ms then
-            ac.log("New session best gate splits for '" .. last.track .. "'.")
-            sessionBestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
-            
-            local all_time_pb_final_time_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#bestGateSplits[trackKey]]) or nil
-            if not all_time_pb_final_time_ms or official_lap_ms < all_time_pb_final_time_ms then
-              bestGateSplits[trackKey] = cloneTable(current_run_gate_splits)
-            end
-          end
-        end
         
-        -- Autosave logic now only needs to check validity, the time comparison is handled above
-        if not last.lapInv then
-          -- ... (The existing all-time PB check and save logic remains here) ...
-          local carKey, carLabel = getCarKeyAndLabel()
-          local all_time_pb_file = appPath(SAVE_FOLDER .. trackKey .. "/" .. carKey .. ".json")
-          local all_time_pb_ms = nil
-          if io.fileExists(all_time_pb_file) then
-            local raw = io.load(all_time_pb_file)
-            if raw then
-              local ok, data = pcall(json.decode, raw)
-              if ok and data.lapMS then all_time_pb_ms = data.lapMS end
-            end
-          end
-          if not all_time_pb_ms or official_lap_ms < all_time_pb_ms then
-            -- ... (save payload creation and saveBestLapForPair call) ...
+        -- Create a final, complete set of splits for this lap, finalized with the server's time.
+        local completed_splits = cloneTable(current_run_gate_splits)
+        completed_splits[#active_route_gates] = official_lap_ms
+
+        -- NEW: Separate validity checks for Session and All-Time PBs
+        local isLapValidForSessionPB = (not last.lapInv or settings.countInvalids)
+        local isLapValidForAllTimePB = not last.lapInv -- This check is strict and ignores the setting.
+
+        -- === Part 1: Update Session PB ===
+        if isLapValidForSessionPB then
+          local current_session_pb_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#active_route_gates]) or nil
+          if not current_session_pb_ms or official_lap_ms < current_session_pb_ms then
+            ac.log("New Session Best for '" .. last.track .. "'. (Lap validity: " .. tostring(not last.lapInv) .. ", Setting allows invalid: " .. tostring(settings.countInvalids) .. ")")
+            sessionBestGateSplits[trackKey] = completed_splits
           end
         else
-          ac.log("[Saves] Lap was invalid. Skipping all-time PB check and save.")
+            ac.log("Lap is invalid and setting is off. Skipping Session PB check.")
+        end
+        
+        -- === Part 2: Update All-Time PB & Save to Disk (Strict Check) ===
+        if isLapValidForAllTimePB then
+          local current_all_time_pb_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#active_route_gates]) or nil
+          if not current_all_time_pb_ms or official_lap_ms < current_all_time_pb_ms then
+            ac.log("New All-Time Best for '" .. last.track .. "'. Preparing to save.")
+            bestGateSplits[trackKey] = completed_splits
+            
+            -- Save the new All-Time PB to a file. This block is now only reachable by valid laps.
+            -- THE FIX IS ON THE NEXT LINE:
+            local carKey, carLabel = getCarKeyAndLabel() -- Corrected function name
+            local payload = {
+              id = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
+              schema = 2,
+              loopName = last.track,
+              loopKey = trackKey,
+              carKey = carKey,
+              carLabel = carLabel,
+              gateCount = #completed_splits,
+              gateSplits = completed_splits,
+              serverSectors = cloneTable(last.secs),
+              lapMS = official_lap_ms,
+              created = os.time()
+            }
+            saveBestLapForPair(payload)
+          end
+        else
+            ac.log("Lap is invalid. Skipping All-Time PB check and disk save.")
         end
       end
       
+      -- This part remains the same: reset state for the next lap.
       local trackName = last.track
       current = newLapState()
       current.track = trackName
@@ -921,6 +981,9 @@ local DeltaFont = ui.DWriteFont('Arial', './data')
     
 
 function windowMain(dt)
+
+    -- TEMPORARY DEBUG LINE: Show the server name
+  --ui.text("" .. tostring(ac.getServerName()))
   -- RUN OUR PER-FRAME GATE LOGIC
   --ui.setNextWindowSize(vec2(windowWidth, windowHeight))
 
@@ -1170,16 +1233,19 @@ function windowSettings(dt)
       if ui.button("Delete saved PB for this loop") then
         local loopKey = toKey(loopName)
         if loopKey ~= "" and carKey ~= "" and carKey ~= "unknown_car" then
-          local pbFile = appPath(SAVE_FOLDER .. loopKey .. "/" .. carKey .. ".json")
+          -- Get the current server type to build the correct path
+          local trafficType = getServerTrafficType()
+          local pbFile = appPath(SAVE_FOLDER .. trafficType .. "/" .. loopKey .. "/" .. carKey .. ".json")
+          
           if io.fileExists(pbFile) then
             os.remove(pbFile)
-            bestGateSplits[loopKey] = nil
+            bestGateSplits[loopKey] = nil -- Note: This clears the in-memory PB for the simple key
             bestLap[loopKey] = nil
             active_gate_pb = {}
             activePB = { secs={}, lap=nil, theoretical=false }
             ac.log("[Saves] Deleted PB file: " .. pbFile)
           else
-            ac.log("[Saves] No PB file exists to be deleted for this pair.")
+            ac.log("[Saves] No PB file exists to be deleted for this pair/traffic type.")
           end
         end
       end
