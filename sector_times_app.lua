@@ -9,7 +9,7 @@ local defaults = {
   useSessionPB    = true,
   showDebugGates  = false,
   showBackground  = true,
-  countInvalids   = false,   -- include invalid sectors/laps in PBs?
+  countInvalids   = true,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
   auto_placement_interval = 1.0, -- ADD THIS LINE (default to 1 second)
   
