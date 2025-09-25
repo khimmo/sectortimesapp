@@ -392,8 +392,6 @@ local function startNewGateLap(trackName)
   current.lapInv = false
 end
 
-
-
 local function cloneLap(src)
   local t = newLapState()
   t.track, t.lap, t.lapInv = src.track, src.lap, src.lapInv
