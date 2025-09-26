@@ -88,6 +88,22 @@ local current_run_gate_splits = {}    -- The gate times for the lap currently in
 local ui_gate_delta_text = "Current Lap Delta: -.--"
 local ui_gate_delta_color = nil
 
+-- NEW: STATE FOR DELTA RATE OF CHANGE CALCULATION
+local last_gate_delta_value = nil   -- The numerical delta value at the previously crossed gate
+local time_at_last_gate = 0.0       -- The total lap time (in seconds) when the last gate was crossed
+local delta_rate_of_change = nil    -- The calculated rate of change (delta seconds / real seconds)
+local smoothed_delta_rate_of_change = nil -- NEW: The smoothed value for the UI bar.
+
+-- A constant to control how much smoothing is applied to the delta rate bar.
+-- Smaller value = more smoothing, but less responsive.
+-- Larger value = less smoothing, but more responsive/jumpy.
+local SMOOTHING_FACTOR = 0.45
+
+-- Higher value = faster, more responsive bar animation.
+-- Lower value = slower, more dampened bar animation.
+local VISUAL_SMOOTHING_SPEED = 10
+
+
 -- ===== Live delta header state (for big number at the top) =====
 local live_delta_value = nil   -- number (e.g., -0.25) ((NOT USED ANYMORE))
 local live_delta_color = nil   -- rgbm (green/yellow) chosen in gate logic ((NOT USED ANYMORE))
@@ -375,6 +391,13 @@ local function startNewGateLap(trackName)
   lap_start_to_gate_1_timer = 0.0
   current_run_gate_splits = {}
   
+  -- NEW: Reset delta rate of change state
+  last_gate_delta_value = nil
+  time_at_last_gate = 0.0
+  delta_rate_of_change = nil
+  smoothed_delta_rate_of_change = nil
+  visual_bar_rate = 0.0
+  
   -- Set the UI to its initial state
   ui_gate_delta_text = "Current Lap Delta: -.--"
   ui_gate_delta_color = nil
@@ -424,8 +447,7 @@ local function lines_intersect(p1, p2, p3, p4)
   return t > 0 and t < 1 and u > 0 and u < 1
 end
 
--- REVISED AND ROBUST GATE CROSSING LOGIC (WITH VALIDATION DEBUGGING)
--- REVISED AND ROBUST GATE CROSSING LOGIC (WITH CLEANER DEBUGGING)
+
 local function checkGateCrossing(dt)
   -- ===== AUTO-PLACEMENT LOGIC (unchanged) =====
   if auto_placement_active then
@@ -525,11 +547,44 @@ local function checkGateCrossing(dt)
       table.insert(current_run_gate_splits, total_time_ms)
     end
     
-    ac.log("Gate " .. found_gate_index .. " triggered. Total Time: " .. fmtMS(total_time_ms))
+    --ac.log("Gate " .. found_gate_index .. " triggered. Total Time: " .. fmtMS(total_time_ms))
     
     local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
     if pb_split_total_time then
       local delta = (total_time_ms - pb_split_total_time) / 1000.0
+      
+      -- ===== MODIFIED: DELTA RATE OF CHANGE CALCULATION WITH SMOOTHING & FIX =====
+      local time_at_this_gate = total_time_ms / 1000.0
+      
+      -- THE FIX: Add a guard to ensure all values are valid numbers before calculating the rate.
+      if last_gate_delta_value ~= nil and type(time_at_this_gate) == "number" and type(time_at_last_gate) == "number" then
+        local change_in_time = time_at_this_gate - time_at_last_gate
+        if change_in_time > 0.01 then -- This line was causing the crash
+          local change_in_delta = delta - last_gate_delta_value
+          delta_rate_of_change = change_in_delta / change_in_time
+          
+          -- Apply Exponential Moving Average (EMA) smoothing
+          if smoothed_delta_rate_of_change == nil then
+            -- On the first calculation, just snap to the raw value
+            smoothed_delta_rate_of_change = delta_rate_of_change
+          else
+            -- For all subsequent calculations, blend the new raw value with the old smoothed value
+            smoothed_delta_rate_of_change = (delta_rate_of_change * SMOOTHING_FACTOR) + (smoothed_delta_rate_of_change * (1 - SMOOTHING_FACTOR))
+          end
+          
+          ac.log(string.format("[Delta Rate] Raw: %.3f, Smoothed: %.3f", delta_rate_of_change, smoothed_delta_rate_of_change))
+        end
+      else
+         ac.log("[Delta Rate] First gate with PB data. Storing initial values, no rate calculated yet.")
+         delta_rate_of_change = nil
+         smoothed_delta_rate_of_change = nil
+      end
+      
+      -- Update state for the next gate crossing
+      last_gate_delta_value = delta
+      time_at_last_gate = time_at_this_gate
+      -- ===============================================
+      
       ui_gate_delta_text = string.format("Current Lap Delta: %+.2f", delta)
       if delta < 0 then ui_gate_delta_color = COL_GREEN else ui_gate_delta_color = COL_YELLOW end
       live_delta_value = delta
@@ -539,6 +594,12 @@ local function checkGateCrossing(dt)
       ui_gate_delta_color = nil
       live_delta_value = nil
       live_delta_color = nil
+      
+      -- MODIFIED: If there is no PB data for this gate, we can't calculate a delta or its rate. Reset all.
+      last_gate_delta_value = nil
+      time_at_last_gate = 0.0
+      delta_rate_of_change = nil
+      smoothed_delta_rate_of_change = 0
     end
     
     last_gate_crossed_index = found_gate_index
@@ -558,6 +619,12 @@ local function checkGateCrossing(dt)
         live_delta_value = nil
         live_delta_color = nil
         lap_start_to_gate_1_timer = -1.0
+        
+        -- MODIFIED: Reset delta rate state on off-track
+        last_gate_delta_value = nil
+        time_at_last_gate = 0.0
+        delta_rate_of_change = nil
+        smoothed_delta_rate_of_change = 0.0 -- Set to 0 to have the bar smoothly return to center.
       end
     end
   end
@@ -870,8 +937,6 @@ local function drawLapBlock(title, lap, opts)
 
   if lap.track and lap.track~="" then ui.text("Route: " .. lap.track) end
 
-  -- The old inline delta text was removed from here. The new big delta is now at the top of windowMain.
-
   local forCountName = (lap.track and lap.track~="" and lap.track) or (opts.fallbackTrackName or "")
   local target = sectorCountFor(forCountName)
 
@@ -1053,6 +1118,58 @@ setTooltipOnHover(tooltipText)
       :weight(ui.DWriteFont.Weight.Bold)
       :style(ui.DWriteFont.Style.Normal)
       :stretch(ui.DWriteFont.Stretch.Normal)
+
+  -- NEW: VISUAL SMOOTHING CALCULATION
+  -- This runs every frame to smoothly animate the bar.
+  do
+    -- THE FIX: Ensure our target value is never nil before passing it to lerp.
+    -- If smoothed_delta_rate_of_change is nil, we treat our target as 0.0.
+    local target_rate = smoothed_delta_rate_of_change or 0.0
+    
+    -- Also ensure the visual_bar_rate itself is not nil, initializing it to 0.0 if necessary.
+    visual_bar_rate = visual_bar_rate or 0.0
+
+    -- math.lerp(current, target, factor) moves current towards target
+    -- dt * SPEED makes the animation frame-rate independent.
+    visual_bar_rate = math.lerp(visual_bar_rate, target_rate, dt * VISUAL_SMOOTHING_SPEED)
+  end
+
+  -- MODIFIED: DELTA RATE OF CHANGE VISUALIZER BAR
+  do
+    -- Configuration for the bar's appearance and behavior
+    local BAR_TOTAL_WIDTH = 150
+    local BAR_HEIGHT = 8
+    local BAR_MAX_RATE = 0.25 
+    local BAR_BG_COLOR = rgbm(0.2, 0.2, 0.2, 0.8)
+
+    local bar_start_pos = ui.getCursor()
+    
+    -- Draw the background container for the bar
+    ui.drawRectFilled(bar_start_pos, bar_start_pos + vec2(BAR_TOTAL_WIDTH, BAR_HEIGHT), BAR_BG_COLOR, 2.0)
+
+    -- MODIFIED: Use the visually smoothed value for drawing. No nil check is needed anymore.
+    local normalized_rate = math.clamp(visual_bar_rate / BAR_MAX_RATE, -1.0, 1.0)
+    
+    -- Calculate geometry
+    local half_width = BAR_TOTAL_WIDTH / 2
+    local center_x = bar_start_pos.x + half_width
+    local bar_segment_width = normalized_rate * half_width
+
+    -- Draw the colored segment
+    if bar_segment_width > 0.1 then -- Losing time, draw to the right (added threshold to avoid tiny slivers)
+      local p1 = vec2(center_x, bar_start_pos.y)
+      local p2 = vec2(center_x + bar_segment_width, bar_start_pos.y + BAR_HEIGHT)
+      ui.drawRectFilled(p1, p2, COL_YELLOW, 2.0)
+    elseif bar_segment_width < -0.1 then -- Gaining time, draw to the left (added threshold)
+      local p1 = vec2(center_x + bar_segment_width, bar_start_pos.y)
+      local p2 = vec2(center_x, bar_start_pos.y + BAR_HEIGHT)
+      ui.drawRectFilled(p1, p2, COL_GREEN, 2.0)
+    end
+    
+    -- Advance the cursor to leave space for the delta number below
+    ui.offsetCursorY(BAR_HEIGHT + 4)
+  end
+  -- END NEW BAR
 
   -- Draw the delta big and colored
   ui.pushFont(DeltaFont)
