@@ -119,6 +119,7 @@ local activePB = { secs={}, lap=nil, theoretical=false }
 local lastRefToggle = settings.refBestSectors
 
 local _saved_pbs_loaded = false
+local _initial_pbs_loaded = false
 
 -- ===== Saving system (per loop + car) =====
 
@@ -1045,10 +1046,26 @@ local DeltaFont = ui.DWriteFont('Arial', './data')
 
 function windowMain(dt)
 
-    -- TEMPORARY DEBUG LINE: Show the server name
-  --ui.text("" .. tostring(ac.getServerName()))
-  -- RUN OUR PER-FRAME GATE LOGIC
-  --ui.setNextWindowSize(vec2(windowWidth, windowHeight))
+  -- NEW: LAZY-LOADING FOR SAVED PBs
+  -- This runs only ONCE on the first frame the UI is active, guaranteeing
+  -- that car and session data is available for the load functions to use.
+  if not _initial_pbs_loaded then
+    _initial_pbs_loaded = true -- Set flag immediately to prevent re-running
+    ac.log("[Saves] UI is active. Performing initial load of PBs for current car...")
+    
+    local ok, err = loadAllPBsForCar()
+    if ok then
+      _saved_pbs_loaded = true -- This flag is for the UI button's logic
+      ac.log("[Saves] Initial load successful.")
+    else
+      _saved_pbs_loaded = false
+      ac.log("[Saves] Initial load failed or no PBs found: " .. tostring(err))
+    end
+    
+    -- After loading, immediately refresh the active PB for the current track
+    -- to ensure the UI updates on this same frame.
+    snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
+  end
 
   if settings.showBackground then
     local p1 = vec2(0, 0)
