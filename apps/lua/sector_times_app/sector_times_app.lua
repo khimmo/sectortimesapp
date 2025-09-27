@@ -10,7 +10,7 @@ local defaults = {
   showDebugGates  = false,
   showBackground  = true,
   countInvalids   = true,   -- include invalid sectors/laps in PBs?
-  refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
+  refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical) -- ADD THIS LINE
   auto_placement_interval = 1.0, -- ADD THIS LINE (default to 1 second)
   
 }
@@ -116,7 +116,8 @@ local sessionBestSecs, sessionBestLap = {}, {}
 -- Snapshot used for CURRENT LAP deltas & PB brackets (frozen on lap start, refreshed after lap completion)
 -- activePB = { secs={...}, lap=<time>, theoretical=<bool> }
 local activePB = { secs={}, lap=nil, theoretical=false }
-local lastRefToggle = settings.refBestSectors
+local lastRefToggle = settings.useSessionPB
+local lastSessionRefToggle = settings.refBestSectors
 
 local _saved_pbs_loaded = false
 local _initial_pbs_loaded = false
@@ -639,7 +640,17 @@ local function fmt(t)
   return string.format("%d:%05.2f", m, s)
 end
 
-local function sum(a) local s=0; for i=1,#a do s=s+(a[i] or 0) end; return s end
+local function sum(a)
+  if type(a) ~= 'table' then return 0 end
+  local s = 0
+  for _, v in pairs(a) do
+    if type(v) == 'number' then
+      s = s + v
+    end
+  end
+  return s
+end
+
 local function anyTrue(arr, upto) local n=upto or #arr; for i=1,n do if arr[i] then return true end end return false end
 
 -- robust colored text wrapper (handles CSP arg orders)
@@ -710,26 +721,40 @@ local function snapshotActivePB(trackName)
   local key = toKey(trackName or "")
   activePB = { secs={}, lap=nil, theoretical=false }
 
-  -- Determine which data source to use based on the toggle
-  local sourceBestLap
   if settings.useSessionPB then
-    sourceBestLap = sessionBestLap[key]
-  else
-    sourceBestLap = bestLap[key]
-  end
-
-  -- We are no longer using the "theoretical best" logic for simplicity with this new system.
-  -- The reference is always the fastest complete lap from the chosen source.
-
-  if sourceBestLap and sourceBestLap.secs then
-    for i, v in ipairs(sourceBestLap.secs) do
-      activePB.secs[i] = v
+    -- SESSION PB MODE
+    if settings.refBestSectors then
+      -- Theoretical Best Session Sectors
+      local sbs = sessionBestSecs[key]
+      -- THE FIX IS HERE: Use next() to check if table is empty and `pairs` to iterate
+      if sbs and next(sbs) ~= nil then
+        for k, v in pairs(sbs) do
+          activePB.secs[k] = v
+        end
+        activePB.lap = sum(sbs)
+        activePB.theoretical = true -- Mark as theoretical
+      end
+    else
+      -- Fastest Complete Session Lap
+      local sbl = sessionBestLap[key]
+      if sbl and sbl.secs then
+        for i, v in ipairs(sbl.secs) do
+          activePB.secs[i] = v
+        end
+        activePB.lap = sbl.lap
+        activePB.theoretical = false
+      end
     end
-    activePB.lap = sourceBestLap.lap
-    activePB.theoretical = false -- It's always a real lap now
   else
-    -- If there's no reference from the chosen source, the UI will be blank.
-    -- This is the correct behavior (e.g., Session PB mode at the start of a session).
+    -- ALL-TIME PB MODE (Fastest Complete Lap)
+    local bl = bestLap[key]
+    if bl and bl.secs then
+      for i, v in ipairs(bl.secs) do
+        activePB.secs[i] = v
+      end
+      activePB.lap = bl.lap
+      activePB.theoretical = false
+    end
   end
 end
 
@@ -787,6 +812,18 @@ local function feed(msg)
       table.insert(current.secs, secT)
       table.insert(current.inv,  inval)
       local idx = #current.secs
+      
+      -- === THIS IS THE NEW BLOCK TO ADD ===
+      -- Update Session Best Sector
+      if not inval or settings.countInvalids then
+        local trackKey = toKey(current.track)
+        sessionBestSecs[trackKey] = sessionBestSecs[trackKey] or {}
+        if not sessionBestSecs[trackKey][idx] or secT < sessionBestSecs[trackKey][idx] then
+          sessionBestSecs[trackKey][idx] = secT
+        end
+      end
+      -- === END OF NEW BLOCK ===
+
       local updated = updBestSector(toKey(current.track), idx, secT, inval)
       if updated then current.pbNew[idx] = true end
       return
@@ -807,6 +844,17 @@ local function feed(msg)
         local finalInv = anyTrue(current.inv, target-1) or lapInvalidFromServer
         current.secs[target] = computed
         current.inv[target]  = finalInv
+
+        -- === FIX 1: ADD THIS BLOCK TO UPDATE SESSION BEST SECTOR FOR THE FINAL SECTOR ===
+        if not finalInv or settings.countInvalids then
+          local trackKey = toKey(current.track)
+          sessionBestSecs[trackKey] = sessionBestSecs[trackKey] or {}
+          if not sessionBestSecs[trackKey][target] or computed < sessionBestSecs[trackKey][target] then
+            sessionBestSecs[trackKey][target] = computed
+          end
+        end
+
+
         updBestSector(toKey(current.track), target, computed, finalInv)
       elseif #current.secs == target then
         current.inv[target] = (current.inv[target] or false) or anyTrue(current.inv, target-1) or lapInvalidFromServer
@@ -909,7 +957,7 @@ local function labelText(txt, invalidFlag)
   end
 end
 
-local function sectorLine(i, val, inv, pbVal, showDelta, showPB)
+local function sectorLine(i, val, inv, pbVal, showDelta, showPB, showSessionRefToggle)
   -- Label: red if invalid
   labelText(string.format("S%-4d", i) , inv)
   if ui.sameLine then ui.sameLine() end
@@ -925,12 +973,23 @@ local function sectorLine(i, val, inv, pbVal, showDelta, showPB)
     ui.text(string.format(" [%s]", fmt(pbVal)))
   end
 
+  -- NEW: Session PB Reference Toggle Button
+  if showSessionRefToggle then
+    ui.sameLine(nil, 20) -- Add a small space
+    if ui.iconButton('toggle_icon.png##SessionRefToggle', vec2(16, 16), nil, nil, 0) then
+      settings.refBestSectors = not settings.refBestSectors
+    end
+    if ui.itemHovered() then
+      local newMode = settings.refBestSectors and "Fastest Lap" or "Best Sectors*"
+      ui.setTooltip("Toggle Session PB reference.\nCurrent: " .. (settings.refBestSectors and "Best Sectors*" or "Fastest Lap") .. "\nClick to switch to: " .. newMode)
+    end
+  end
+
   -- Delta (green negative, yellow positive, neutral ~0)
   if showDelta and val and pbVal then
     drawDeltaInline(val - pbVal)
   end
 end
-
 local function drawLapBlock(title, lap, opts)
   if title ~= "Current Lap" then -- Only draw title for "Last Lap"
     ui.text(title)
@@ -946,7 +1005,11 @@ local function drawLapBlock(title, lap, opts)
     local iv = lap.inv[i]
     -- always fetch PB for coloring, even if we’re not showing [PB] brackets
     local pbForColor = (opts.pbRef and opts.pbRef.secs and opts.pbRef.secs[i]) or nil
-    sectorLine(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB)
+
+    -- NEW: Determine if the toggle button should be shown for this line
+    local showToggle = opts.showSessionRefToggle and i == 1
+
+    sectorLine(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB, showToggle)
   end
 
   -- LAP label (red if invalid)
@@ -1084,9 +1147,15 @@ function windowMain(dt)
 
   checkGateCrossing(dt)
 
-  -- If reference mode changed, resnapshot immediately
-  if lastRefToggle ~= settings.refBestSectors then
-    lastRefToggle = settings.refBestSectors
+   -- If the MAIN reference mode changed (Session vs All-Time), resnapshot immediately
+  if lastRefToggle ~= settings.useSessionPB then
+    lastRefToggle = settings.useSessionPB
+    snapshotActivePB(current.track ~= "" and current.track or last.track or "")
+  end
+  
+  -- If the SESSION reference mode changed (Fastest Lap vs Best Sectors), resnapshot immediately
+  if lastSessionRefToggle ~= settings.refBestSectors then
+    lastSessionRefToggle = settings.refBestSectors
     snapshotActivePB(current.track ~= "" and current.track or last.track or "")
   end
 
@@ -1107,7 +1176,7 @@ ui.text(titleText)
 ui.sameLine()
 
 -- 3. Create the button with the new on-demand loading logic
-if ui.iconButton('toggle_icon.png', vec2(20, 20), nil, nil, 0) then
+if ui.iconButton('toggle_icon.png##MainModeToggle', vec2(20, 20), nil, nil, 0) then
   -- If we are switching TO Saved PB mode...
   if settings.useSessionPB == true then
     -- ...and we haven't loaded the PBs yet this session...
@@ -1219,7 +1288,8 @@ setTooltipOnHover(tooltipText)
     showSectorPB      = true,
     showLapPB         = true,
     pbRef             = activePB,
-    fallbackTrackName = last.track
+    fallbackTrackName = last.track,
+    showSessionRefToggle = settings.useSessionPB -- THIS IS THE NEW OPTION TO PASS
   })
 
   -- LAST LAP (always visible; pace-colored times; no brackets/deltas)
