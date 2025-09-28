@@ -27,6 +27,8 @@ local gate_debounce_timer = 0.0
 local auto_placement_active = false
 local auto_placement_timer = 0.0
 
+local __FORCE_GATE_SKIP_TEST = false
+
 
 
 -- ===== Manual sector counts (exact spellings) =====
@@ -70,6 +72,10 @@ end
 local current = newLapState()
 local last    = newLapState()
 local feed
+
+-- NEW: State for the PB notification message
+local show_pb_notification = false
+local pb_notification_route_name = ""
 
 -- ===== Gate Crossing State =====
 local timing_mode = "server"        -- "server" or "gates"
@@ -510,7 +516,6 @@ local function checkGateCrossing(dt)
     
     if (side_last * side_current <= 0) and (gate_debounce_timer == 0) then
       if (side_last < 0 and side_current >= 0) then
-        -- THIS IS THE CHANGE: The "Correct Side" log message has been removed.
         found_gate_index = i
         break
       else
@@ -518,66 +523,83 @@ local function checkGateCrossing(dt)
       end
     end
   end
+
+  if __FORCE_GATE_SKIP_TEST and found_gate_index == 5 then
+    ac.log("[DEBUG] Intercepted crossing of Gate #5. Forcing a skip to #7.")
+    found_gate_index = 7 -- Pretend we just crossed gate 7 instead of 5
+  end
+  -- END OF DEBUG BLOCK
   
   if found_gate_index ~= -1 then
-    -- NEW: SKIPPED GATE DETECTION LOGIC
-    local expected_gate = last_gate_crossed_index + 1
-    if found_gate_index > expected_gate then
-      local first_skipped = expected_gate
-      local last_skipped = found_gate_index - 1
-      if first_skipped == last_skipped then
-        ac.log(string.format("[Gate Logic] SKIPPED Gate #%d. Crossed #%d instead.", first_skipped, found_gate_index))
-      else
-        ac.log(string.format("[Gate Logic] SKIPPED Gates #%d through #%d. Crossed #%d instead.", first_skipped, last_skipped, found_gate_index))
-      end
-    end
-    -- END NEW LOGIC
-
     gate_debounce_timer = 0.1
-    local total_time_ms
+    local time_at_found_gate_ms
 
+    -- First, calculate the total time to the gate that was actually crossed.
     if found_gate_index == 1 then
-      ac.log("Gate 1 crossed. Capturing Split Zero.")
-      local split_zero_time_ms = lap_start_to_gate_1_timer * 1000
-      lap_start_to_gate_1_timer = -1.0
-      manual_lap_timer = 0.0
-      table.insert(current_run_gate_splits, split_zero_time_ms)
-      total_time_ms = split_zero_time_ms
+      time_at_found_gate_ms = lap_start_to_gate_1_timer * 1000
     else
       local split_zero_time_ms = current_run_gate_splits[1] or 0
-      total_time_ms = split_zero_time_ms + (manual_lap_timer * 1000)
-      table.insert(current_run_gate_splits, total_time_ms)
+      time_at_found_gate_ms = split_zero_time_ms + (manual_lap_timer * 1000)
+    end
+
+    -- === NEW: SKIPPED GATE INTERPOLATION LOGIC ===
+    local expected_gate_index = last_gate_crossed_index + 1
+    if found_gate_index > expected_gate_index then
+      ac.log(string.format("[Gate Interpolation] Skipped gates %d through %d. Interpolating times.", expected_gate_index, found_gate_index - 1))
+
+      -- Get the time and index of the last valid gate crossing
+      local start_index = last_gate_crossed_index
+      local start_time = (start_index > 0 and current_run_gate_splits[start_index]) or 0
+
+      -- Define the time and index for the gate we just crossed
+      local end_index = found_gate_index
+      local end_time = time_at_found_gate_ms
+
+      local time_diff = end_time - start_time
+      local index_diff = end_index - start_index
+
+      -- Loop through the gates that were missed and add an interpolated time for each
+      for i = start_index + 1, end_index - 1 do
+        local progress = (i - start_index) / index_diff
+        local interpolated_time = start_time + (time_diff * progress)
+        table.insert(current_run_gate_splits, interpolated_time)
+        ac.log(string.format("  -> Interpolated Gate #%d at %s", i, fmtMS(interpolated_time)))
+      end
+    end
+    -- === END OF NEW LOGIC ===
+
+    -- Now, add the actual, measured time for the gate that was crossed.
+    table.insert(current_run_gate_splits, time_at_found_gate_ms)
+
+    -- Reset timers if this was the first gate crossing of the lap.
+    if found_gate_index == 1 then
+      lap_start_to_gate_1_timer = -1.0
+      manual_lap_timer = 0.0
     end
     
-    --ac.log("Gate " .. found_gate_index .. " triggered. Total Time: " .. fmtMS(total_time_ms))
+    -- The delta calculation can now proceed, confident that the array is correctly structured.
+    local total_time_ms = time_at_found_gate_ms -- Use this for the delta calc
     
     local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
     if pb_split_total_time then
       local delta = (total_time_ms - pb_split_total_time) / 1000.0
       
-      -- ===== MODIFIED: DELTA RATE OF CHANGE CALCULATION WITH SMOOTHING & FIX =====
+      -- ===== DELTA RATE OF CHANGE CALCULATION WITH SMOOTHING & FIX =====
       local time_at_this_gate = total_time_ms / 1000.0
       
-      -- THE FIX: Add a guard to ensure all values are valid numbers before calculating the rate.
       if last_gate_delta_value ~= nil and type(time_at_this_gate) == "number" and type(time_at_last_gate) == "number" then
         local change_in_time = time_at_this_gate - time_at_last_gate
-        if change_in_time > 0.01 then -- This line was causing the crash
+        if change_in_time > 0.01 then
           local change_in_delta = delta - last_gate_delta_value
           delta_rate_of_change = change_in_delta / change_in_time
           
-          -- Apply Exponential Moving Average (EMA) smoothing
           if smoothed_delta_rate_of_change == nil then
-            -- On the first calculation, just snap to the raw value
             smoothed_delta_rate_of_change = delta_rate_of_change
           else
-            -- For all subsequent calculations, blend the new raw value with the old smoothed value
             smoothed_delta_rate_of_change = (delta_rate_of_change * SMOOTHING_FACTOR) + (smoothed_delta_rate_of_change * (1 - SMOOTHING_FACTOR))
           end
-          
-          ac.log(string.format("[Delta Rate] Raw: %.3f, Smoothed: %.3f", delta_rate_of_change, smoothed_delta_rate_of_change))
         end
       else
-         ac.log("[Delta Rate] First gate with PB data. Storing initial values, no rate calculated yet.")
          delta_rate_of_change = nil
          smoothed_delta_rate_of_change = nil
       end
@@ -597,7 +619,6 @@ local function checkGateCrossing(dt)
       live_delta_value = nil
       live_delta_color = nil
       
-      -- MODIFIED: If there is no PB data for this gate, we can't calculate a delta or its rate. Reset all.
       last_gate_delta_value = nil
       time_at_last_gate = 0.0
       delta_rate_of_change = nil
@@ -622,11 +643,10 @@ local function checkGateCrossing(dt)
         live_delta_color = nil
         lap_start_to_gate_1_timer = -1.0
         
-        -- MODIFIED: Reset delta rate state on off-track
         last_gate_delta_value = nil
         time_at_last_gate = 0.0
         delta_rate_of_change = nil
-        smoothed_delta_rate_of_change = 0.0 -- Set to 0 to have the bar smoothly return to center.
+        smoothed_delta_rate_of_change = 0.0
       end
     end
   end
@@ -720,19 +740,27 @@ end
 local function snapshotActivePB(trackName)
   local key = toKey(trackName or "")
   activePB = { secs={}, lap=nil, theoretical=false }
+  local targetSectorCount = sectorCountFor(trackName) -- Get the required number of sectors
 
   if settings.useSessionPB then
     -- SESSION PB MODE
     if settings.refBestSectors then
       -- Theoretical Best Session Sectors
       local sbs = sessionBestSecs[key]
-      -- THE FIX IS HERE: Use next() to check if table is empty and `pairs` to iterate
       if sbs and next(sbs) ~= nil then
+        local populatedCount = 0
         for k, v in pairs(sbs) do
           activePB.secs[k] = v
+          populatedCount = populatedCount + 1
         end
-        activePB.lap = sum(sbs)
-        activePB.theoretical = true -- Mark as theoretical
+
+        -- NEW CHECK: Only calculate the lap time if all sectors are present
+        if populatedCount >= targetSectorCount then
+          activePB.lap = sum(sbs)
+        else
+          activePB.lap = nil -- Explicitly ensure lap time is nil
+        end
+        activePB.theoretical = true
       end
     else
       -- Fastest Complete Session Lap
@@ -826,6 +854,9 @@ local function feed(msg)
 
       local updated = updBestSector(toKey(current.track), idx, secT, inval)
       if updated then current.pbNew[idx] = true end
+
+      snapshotActivePB(current.track)
+
       return
     end
   end
@@ -834,6 +865,8 @@ local function feed(msg)
   do
     local m,s = msg:match("Lap%s+time%s+for%s+.-:%s*(%d+):([%d%.]+)")
     if m then
+      show_pb_notification = false
+
       local lapInvalidFromServer = msg:find("%(invalid%)") ~= nil
       local lapT  = (tonumber(m) or 0)*60 + (tonumber(s) or 0)
       current.lap, current.lapInv = lapT, lapInvalidFromServer
@@ -909,7 +942,7 @@ local function feed(msg)
             bestGateSplits[trackKey] = completed_splits
             
             -- Save the new All-Time PB to a file. This block is now only reachable by valid laps.
-            -- THE FIX IS ON THE NEXT LINE:
+            
             local carKey, carLabel = getCarKeyAndLabel() -- Corrected function name
             local payload = {
               id = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
@@ -925,6 +958,11 @@ local function feed(msg)
               created = os.time()
             }
             saveBestLapForPair(payload)
+
+            show_pb_notification = true
+            pb_notification_route_name = last.track
+            -- END OF NEW BLOCK
+
           end
         else
             ac.log("Lap is invalid. Skipping All-Time PB check and disk save.")
@@ -944,7 +982,15 @@ end
 
 -- ===== Chat hook =====
 ac.onChatMessage(function(message, senderCarIndex)
-  feed(tostring(message or ""))
+  -- Only process the message if it comes from the server (senderCarIndex == -1).
+  -- This prevents players from manually typing chat messages to trigger fake times.
+  
+
+  if senderCarIndex == -1 then
+    feed(tostring(message or ""))
+  end
+  
+  -- We always return false so the message still appears in the regular chat app.
   return false
 end)
 
@@ -957,7 +1003,7 @@ local function labelText(txt, invalidFlag)
   end
 end
 
-local function sectorLine(i, val, inv, pbVal, showDelta, showPB, showSessionRefToggle)
+local function sectorLine(i, val, inv, pbVal, showDelta, showPB)
   -- Label: red if invalid
   labelText(string.format("S%-4d", i) , inv)
   if ui.sameLine then ui.sameLine() end
@@ -973,43 +1019,31 @@ local function sectorLine(i, val, inv, pbVal, showDelta, showPB, showSessionRefT
     ui.text(string.format(" [%s]", fmt(pbVal)))
   end
 
-  -- NEW: Session PB Reference Toggle Button
-  if showSessionRefToggle then
-    ui.sameLine(nil, 20) -- Add a small space
-    if ui.iconButton('toggle_icon.png##SessionRefToggle', vec2(16, 16), nil, nil, 0) then
-      settings.refBestSectors = not settings.refBestSectors
-    end
-    if ui.itemHovered() then
-      local newMode = settings.refBestSectors and "Fastest Lap" or "Best Sectors*"
-      ui.setTooltip("Toggle Session PB reference.\nCurrent: " .. (settings.refBestSectors and "Best Sectors*" or "Fastest Lap") .. "\nClick to switch to: " .. newMode)
-    end
-  end
-
   -- Delta (green negative, yellow positive, neutral ~0)
   if showDelta and val and pbVal then
     drawDeltaInline(val - pbVal)
   end
 end
+
 local function drawLapBlock(title, lap, opts)
-  if title ~= "Current Lap" then -- Only draw title for "Last Lap"
-    ui.text(title)
+  -- NEW: Handle the PB notification title
+  if title == "Last Lap" then
+    if show_pb_notification then
+      local notification_text = string.format("PB for %s saved", pb_notification_route_name)
+      textColoredCompat(notification_text, COL_GREEN)
+    else
+      ui.text("Last Lap")
+    end
   end
 
-  if lap.track and lap.track~="" then ui.text("Route: " .. lap.track) end
-
-  local forCountName = (lap.track and lap.track~="" and lap.track) or (opts.fallbackTrackName or "")
+  local forCountName = (lap.track and lap.track ~= "" and lap.track) or (opts.fallbackTrackName or "")
   local target = sectorCountFor(forCountName)
 
   for i=1,target do
     local v  = lap.secs[i]
     local iv = lap.inv[i]
-    -- always fetch PB for coloring, even if we’re not showing [PB] brackets
     local pbForColor = (opts.pbRef and opts.pbRef.secs and opts.pbRef.secs[i]) or nil
-
-    -- NEW: Determine if the toggle button should be shown for this line
-    local showToggle = opts.showSessionRefToggle and i == 1
-
-    sectorLine(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB, showToggle)
+    sectorLine(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB)
   end
 
   -- LAP label (red if invalid)
@@ -1280,16 +1314,36 @@ setTooltipOnHover(tooltipText)
   ui.separator()
   
   -- =======================================================
+  
+  -- NEW: Route Name and Session Reference Toggle
+  do
+    -- Only show the button if in Session PB mode
+    if settings.useSessionPB then
+      if ui.iconButton('toggle_icon.png##SessionRefToggle', vec2(16, 16), nil, nil, 0) then
+        settings.refBestSectors = not settings.refBestSectors
+      end
+      if ui.itemHovered() then
+        local currentMode = settings.refBestSectors and "Best Sectors*" or "Fastest Lap"
+        local newMode = settings.refBestSectors and "Fastest Lap" or "Best Sectors*"
+        ui.setTooltip("Current: " .. currentMode .. "\n\nToggles whether the app displays your fastest sectors from the session or the sectors from your fastest lap of the session.\n\n* symbol indicates a theoretical laptime by combining all your best sectors.")
+      end
+      ui.sameLine(nil, 4) -- Add a small space
+    end
+
+    -- Determine the route name to display
+    local routeName = (current.track and current.track ~= "") and current.track
+                   or (last.track and last.track ~= "") and last.track
+                   or "N/A"
+    ui.text("Route: " .. routeName)
+  end
 
   -- CURRENT LAP (brackets + deltas)
-  
   drawLapBlock("Current Lap", current, {
     showDeltas        = true,
     showSectorPB      = true,
     showLapPB         = true,
     pbRef             = activePB,
-    fallbackTrackName = last.track,
-    showSessionRefToggle = settings.useSessionPB -- THIS IS THE NEW OPTION TO PASS
+    fallbackTrackName = last.track
   })
 
   -- LAST LAP (always visible; pace-colored times; no brackets/deltas)
@@ -1413,6 +1467,11 @@ function windowSettings(dt)
         settings.countInvalids = not settings.countInvalids
       end
 
+      do
+        local tooltip_text = "Toggles whether the app can use your best invalid laps/sectors of this session as a reference.\n\nThis setting does not affect all-time Saved PB's which are saved to disk and can be loaded in future sessions, those MUST be valid."
+        setTooltipOnHover(tooltip_text)
+      end
+
       ui.separator()
       ui.separator()
       
@@ -1456,6 +1515,18 @@ function windowSettings(dt)
       if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
     settings.showDebugGates = not settings.showDebugGates
   end
+
+  ui.separator()
+      ui.textColored("--- DEBUGGING ---", COL_YELLOW)
+      if ui.checkbox("Force Gate Skip (Test)", __FORCE_GATE_SKIP_TEST) then
+        __FORCE_GATE_SKIP_TEST = not __FORCE_GATE_SKIP_TEST
+        if __FORCE_GATE_SKIP_TEST then
+          ac.log("[DEBUG] Gate skip simulation ENABLED. Crossing gate #5 will simulate a skip to #7.")
+        else
+          ac.log("[DEBUG] Gate skip simulation DISABLED.")
+        end
+      end
+
   ui.separator()
       drawGateEditor()
     end)
