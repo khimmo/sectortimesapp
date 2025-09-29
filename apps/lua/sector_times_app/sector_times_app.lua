@@ -423,10 +423,10 @@ local function startNewGateLap(trackName, startTimeOffset)
 
   local pb_data_source = nil
   if settings.useSessionPB then
-    ac.log("Mode: Session PB. Using session data for live delta.")
+    --ac.log("Mode: Session PB. Using session data for live delta.")
     pb_data_source = sessionBestGateSplits[trackKey]
   else
-    ac.log("Mode: Saved PB. Using all-time data for live delta.")
+    --ac.log("Mode: Saved PB. Using all-time data for live delta.")
     pb_data_source = bestGateSplits[trackKey]
   end
 
@@ -547,6 +547,8 @@ local function checkTriggerGateCrossings(dt)
   for routeName, gate in pairs(trigger_gates) do
     if not preemptive_timers[routeName] then
       local gate_p1 = gate.p1; local gate_p2 = gate.p2
+      
+      -- Step 1: Check if we crossed the gate's infinite line from the correct direction.
       local gate_vec = {x = gate_p2.x - gate_p1.x, z = gate_p2.z - gate_p1.z}
       local vec_to_last = {x = last_pos.x - gate_p1.x, z = last_pos.z - gate_p1.z}
       local side_last = gate_vec.x * vec_to_last.z - gate_vec.z * vec_to_last.x
@@ -554,14 +556,22 @@ local function checkTriggerGateCrossings(dt)
       local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
       
       if side_last < 0 and side_current >= 0 then
-        ac.log("[Triggers] Physical trigger crossed for: '" .. routeName .. "'. Starting pre-emptive timer.")
-        local currentTime = os.preciseClock()
-        preemptive_timers[routeName] = {
-          startTime = currentTime,
-          expiryTime = currentTime + PREEMPTIVE_TIMEOUT
-        }
-        trigger_gate_debounce = 0.5 -- Debounce to prevent multiple triggers on the same frame
-        break
+        -- Step 2: THE NEW, EFFICIENT CHECK. Check distance to gate center.
+        local gate_center_x = (gate_p1.x + gate_p2.x) / 2
+        local gate_center_z = (gate_p1.z + gate_p2.z) / 2
+        local dist_sq = (current_pos_vec3.x - gate_center_x)^2 + (current_pos_vec3.z - gate_center_z)^2
+        local half_width_sq = (GATE_WIDTH / 2)^2
+
+        if dist_sq <= half_width_sq then
+          ac.log("[Triggers] Physical trigger crossed for: '" .. routeName .. "'. Starting pre-emptive timer.")
+          local currentTime = os.preciseClock()
+          preemptive_timers[routeName] = {
+            startTime = currentTime,
+            expiryTime = currentTime + PREEMPTIVE_TIMEOUT
+          }
+          trigger_gate_debounce = 0.5
+          break
+        end
       end
     end
   end
@@ -714,7 +724,7 @@ local function checkGateCrossing(dt)
     last_gate_crossed_index = found_gate_index
   else
     -- OFF-ROUTE / RESET LOGIC
-    if (last_gate_crossed_index > 0 or next(preemptive_timers) ~= nil) and #current_route.gates > 0 then
+    if ((current.track and current.track ~= "") or next(preemptive_timers) ~= nil) and #current_route.gates > 0 then
       local next_gate_to_check_index = last_gate_crossed_index + 1
       if next_gate_to_check_index > #current_route.gates then return end
       local primary_gate_to_check = current_route.gates[next_gate_to_check_index]
@@ -1660,12 +1670,12 @@ function windowSettings(dt)
       end
     end)
     ui.tabItem("Route Editor", function()
+      
+      ui.textColored("--- DEBUGGING ---", COL_YELLOW)
+
       if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
         settings.showDebugGates = not settings.showDebugGates
       end
-
-      ui.separator()
-      ui.textColored("--- DEBUGGING ---", COL_YELLOW)
 
       -- NEW: UI for controlling the delay simulation
       if ui.checkbox("Simulate Server Message Delay", __SIMULATE_MESSAGE_DELAY) then
