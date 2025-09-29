@@ -84,8 +84,9 @@ local function sectorCountFor(trackName) return manualCount[trackName] or 3 end
 
 -- ===== State =====
 local function newLapState()
-  return { track="", lap=nil, lapInv=false, secs={}, inv={}, pbNew={} }
+  return { track="", lap=nil, lapInv=false, secs={}, inv={}, pbNew={}}
 end
+
 local current = newLapState()
 local last    = newLapState()
 local feed
@@ -319,11 +320,9 @@ local function loadAllPBsForCar()
     return false, "Could not identify the current car."
   end
   
-  -- 1. Determine which subfolder to load from
   local trafficType = getServerTrafficType()
   ac.log(string.format("[Saves] Scanning for PBs for car: %s (%s) | Server Type: %s", carLabel, carKey, trafficType))
 
-  -- 2. Define the specific directory to scan
   local specificSaveDir = appPath(SAVE_FOLDER .. trafficType .. "/")
 
   if not io.dirExists(specificSaveDir) then
@@ -331,7 +330,6 @@ local function loadAllPBsForCar()
     return false, "No PBs found for this server type."
   end
 
-  -- Use io.scanDir to get our loop keys from the specific traffic folder
   local loopDirs = {}
   io.scanDir(specificSaveDir, '*', function(entryName, attributes)
     if attributes.isDirectory then
@@ -355,13 +353,29 @@ local function loadAllPBsForCar()
         if ok and type(lapData) == 'table' then
           local currentLoopKey = lapData.loopKey or loopKey
 
-          -- Load Gate Splits (for delta timing)
-          if type(lapData.gateSplits) == 'table' then
-            lapData.gateSplits.lapMS = lapData.lapMS
-            bestGateSplits[currentLoopKey] = cloneTable(lapData.gateSplits)
+          -- NEW: Backwards Compatibility and New Format Loading
+          local pbGateData = nil
+          if type(lapData.gateSplits) == 'table' and type(lapData.lapMS) == 'number' then
+            -- This is the NEW structured format. The splits are already physical.
+            pbGateData = {
+              gateSplits = cloneTable(lapData.gateSplits),
+              lapMS = lapData.lapMS
+            }
+          elseif type(lapData[1]) == 'number' and lapData.schema ~= 2 then
+            -- This is the OLD flat array format. The splits are a mix of physical and server time.
+            ac.log("[Saves] Old PB format detected for '"..currentLoopKey.."'. Loading as-is for compatibility.")
+            local oldSplits = cloneTable(lapData)
+            local oldLapMS = oldSplits[#oldSplits]
+            pbGateData = {
+              gateSplits = oldSplits,
+              lapMS = oldLapMS
+            }
+          end
+
+          if pbGateData then
+            bestGateSplits[currentLoopKey] = pbGateData
           end
           
-          -- Load Server Sector Times (for UI display)
           if type(lapData.serverSectors) == 'table' and lapData.lapMS then
             bestLap[currentLoopKey] = {
               lap = lapData.lapMS / 1000,
@@ -372,7 +386,7 @@ local function loadAllPBsForCar()
             end
           end
 
-          ac.log(string.format("[Saves] Loaded PB for '%s': %s", lapData.loopName, fmtMS(lapData.lapMS)))
+          ac.log(string.format("[Saves] Loaded PB for '%s': %s", lapData.loopName or currentLoopKey, fmtMS(pbGateData and pbGateData.lapMS)))
           loadedCount = loadedCount + 1
         end
       end
@@ -382,18 +396,10 @@ local function loadAllPBsForCar()
   if loadedCount == 0 then
     return false, "No saved PBs found for this car on this server type."
   end
-
-  -- Refresh the active PB for the current loop, if one was just loaded
-  local currentLoopKey = toKey((current_route and current_route.name) or (current and current.track) or "")
-  if currentLoopKey ~= "" and bestGateSplits[currentLoopKey] then
-    active_gate_pb = bestGateSplits[currentLoopKey]
-    ac.log("[Saves] Active PB for current loop '"..currentLoopKey.."' has been refreshed.")
-  end
   
   ac.log(string.format("[Saves] Finished loading. Imported %d PBs for '%s'.", loadedCount, carLabel))
   return true
 end
-
 
 function script.init()
   -- This function is called once when the script loads.
@@ -404,55 +410,50 @@ end
 -- ===== Helpers =====
 --local function toKey(name) return (name or ""):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
 
-local function startNewGateLap(trackName, startTimeOffset)
-  startTimeOffset = startTimeOffset or 0.0 -- Default to 0 if not provided
-
+local function startNewGateLap(trackName)
   local trafficType = getServerTrafficType()
   local displayType = (trafficType == "traffic" and "Traffic") or (trafficType == "notraffic" and "No Traffic") or "Unknown"
 
-  ac.log(string.format("Starting new gate lap for: %s [%s] | Offset: %.3fs", trackName, displayType, startTimeOffset))
+  ac.log(string.format("Starting new gate lap for: %s [%s]", trackName, displayType))
   
   active_route_gates = current_route.gates
   local trackKey = toKey(trackName)
 
+  local pb_data_source = nil
   if settings.useSessionPB then
     ac.log("Mode: Session PB. Using session data for live delta.")
-    -- Ensure the table exists for this track, but it might be empty (which is correct for the first lap)
-    sessionBestGateSplits[trackKey] = sessionBestGateSplits[trackKey] or {}
-    active_gate_pb = sessionBestGateSplits[trackKey]
+    pb_data_source = sessionBestGateSplits[trackKey]
   else
     ac.log("Mode: Saved PB. Using all-time data for live delta.")
-    bestGateSplits[trackKey] = bestGateSplits[trackKey] or {}
-    active_gate_pb = bestGateSplits[trackKey]
+    pb_data_source = bestGateSplits[trackKey]
   end
 
-  ac.log("Loaded " .. #active_gate_pb .. " PB gate splits.")
+  if pb_data_source and type(pb_data_source.gateSplits) == 'table' then
+    active_gate_pb = pb_data_source.gateSplits
+    ac.log("Loaded " .. #active_gate_pb .. " PB gate splits for comparison.")
+  else
+    active_gate_pb = {}
+    ac.log("No valid PB data found for this route. Starting fresh.")
+  end
 
-   -- Reset all gate-related states for the new lap
+  -- Reset all live timing states for the new lap
   last_gate_crossed_index = 0
-  last_pos = nil 
-  manual_lap_timer = startTimeOffset -- THE KEY CHANGE: Start timer with the offset
+  --last_pos = nil 
+  manual_lap_timer = 0.0 -- Physical timer ALWAYS starts from zero on trigger
   gate_debounce_timer = 0.0
-  -- lap_start_to_gate_1_timer = 0.0 -- OLD TIMER: We no longer need this
   current_run_gate_splits = {}
   
-  -- NEW: Reset delta rate of change state
   last_gate_delta_value = nil
   time_at_last_gate = 0.0
   delta_rate_of_change = nil
   smoothed_delta_rate_of_change = nil
   visual_bar_rate = 0.0
   
-  -- Set the UI to its initial state
   ui_gate_delta_text = "Current Lap Delta: -.--"
   ui_gate_delta_color = nil
-
   live_delta_value = nil
   live_delta_color = nil
 
-  -- We still need to set the 'current.track' for the UI to display the name
-  current.track = trackName
-  -- Clear out old server sector data for the new run
   current.secs = {}
   current.inv = {}
   current.pbNew = {}
@@ -509,11 +510,37 @@ local function cleanupExpiredPreemptiveTimers(dt)
   end
 end
 
+local function resetProvisionalLapState()
+  ac.log("[State] Resetting all provisional lap state.")
+  preemptive_timers = {}
+  manual_lap_timer = 0.0
+  current_route = { name = "", gates = {} }
+  active_route_gates = {}
+  last_gate_crossed_index = 0
+  current_run_gate_splits = {}
+  trigger_gate_debounce = 0.0
+  last_pos = nil
+  -- Also clear the main lap indicator
+  if current then
+    current.track = ""
+  end
+end
+
 local function checkTriggerGateCrossings(dt)
+  -- If an official lap is already in progress, or a provisional one is waiting, do nothing.
+  if (current.track and current.track ~= "") or next(preemptive_timers) ~= nil then return end
+
   trigger_gate_debounce = math.max(0, trigger_gate_debounce - dt)
   if trigger_gate_debounce > 0 then return end
 
-  if not last_pos then return end
+  if not last_pos then
+  local owncar = ac.getCar(0)
+  if owncar and owncar.position then
+    local p = owncar.position
+    last_pos = { x = p.x, y = p.y, z = p.z }
+  end
+  return
+end
   
   local owncar = ac.getCar(0)
   if not owncar or not owncar.position then return end
@@ -529,12 +556,29 @@ local function checkTriggerGateCrossings(dt)
       local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
       
       if side_last < 0 and side_current >= 0 then
-        ac.log("[Triggers] Pre-emptive trigger crossed for: " .. routeName)
-        local currentTime = os.preciseClock() -- THE FIX: Use os.preciseClock()
+        --ac.log("[Triggers] PROVISIONAL LAP START for: " .. routeName)
+        ac.log("[TIMER_DEBUG] PHYSICAL TRIGGER: Provisional lap started for '" .. routeName .. "'. Timer starts NOW.")
+        
+        local currentTime = os.preciseClock()
         preemptive_timers[routeName] = {
           startTime = currentTime,
           expiryTime = currentTime + PREEMPTIVE_TIMEOUT
         }
+        
+        local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+        local filepath = app_folder .. 'routes/' .. routeName .. '.json'
+        local route_json_string = io.load(filepath)
+        if route_json_string then
+          current_route = json.decode(route_json_string)
+          ac.log("Provisional route loaded with " .. #current_route.gates .. " gates.")
+        else
+          ac.log("Could not find route file for provisional lap. Aborting.")
+          preemptive_timers[routeName] = nil
+          return
+        end
+
+        startNewGateLap(routeName) -- This will start the manual_lap_timer
+        
         trigger_gate_debounce = 0.5
         break
       end
@@ -568,11 +612,8 @@ local function checkGateCrossing(dt)
 
   gate_debounce_timer = math.max(0, gate_debounce_timer - dt)
 
-  -- NEW CUMULATIVE TIMER LOGIC
-  -- Only increment the lap timer if a lap is officially active.
-  -- The server "feed" function's call to startNewGateLap is our start signal.
-  -- `current.track` being set is the best indicator of an active lap.
-  if current.track and current.track ~= "" then
+  -- TIMER LOGIC: Increment timer if an official lap OR a provisional lap is active.
+  if (current.track and current.track ~= "") or next(preemptive_timers) ~= nil then
     manual_lap_timer = manual_lap_timer + dt
   end
   
@@ -614,23 +655,21 @@ local function checkGateCrossing(dt)
 
   if __FORCE_GATE_SKIP_TEST and found_gate_index == 5 then
     ac.log("[DEBUG] Intercepted crossing of Gate #5. Forcing a skip to #7.")
-    found_gate_index = 7 -- Pretend we just crossed gate 7 instead of 5
+    found_gate_index = 7
   end
   
   if found_gate_index ~= -1 then
     gate_debounce_timer = 0.1
-    -- SIMPLIFIED: The cumulative time is simply the current value of our single lap timer.
-    local time_at_found_gate_ms = manual_lap_timer * 1000
+    local physical_time_ms = manual_lap_timer * 1000
 
-    -- === SKIPPED GATE INTERPOLATION LOGIC (unchanged) ===
+    -- === SKIPPED GATE INTERPOLATION LOGIC ===
     local expected_gate_index = last_gate_crossed_index + 1
     if found_gate_index > expected_gate_index then
       ac.log(string.format("[Gate Interpolation] Skipped gates %d through %d. Interpolating times.", expected_gate_index, found_gate_index - 1))
-
       local start_index = last_gate_crossed_index
       local start_time = (start_index > 0 and current_run_gate_splits[start_index]) or 0
       local end_index = found_gate_index
-      local end_time = time_at_found_gate_ms
+      local end_time = physical_time_ms
       local time_diff = end_time - start_time
       local index_diff = end_index - start_index
 
@@ -643,19 +682,17 @@ local function checkGateCrossing(dt)
     end
     -- === END OF INTERPOLATION LOGIC ===
 
-    -- Now, add the actual, measured time for the gate that was crossed.
-    table.insert(current_run_gate_splits, time_at_found_gate_ms)
+    table.insert(current_run_gate_splits, physical_time_ms)
 
-    -- NOTE: The old timer reset logic for Gate 1 has been removed. The timer is never reset.
-    
-    local total_time_ms = time_at_found_gate_ms
+    local total_time_ms = physical_time_ms -- Total time for delta IS the physical time
     local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
     
     if pb_split_total_time then
+      -- The delta is a direct physical vs physical comparison.
       local delta = (total_time_ms - pb_split_total_time) / 1000.0
       
-      -- ===== DELTA RATE OF CHANGE CALCULATION (unchanged) =====
-      local time_at_this_gate = total_time_ms / 1000.0
+      -- ===== DELTA RATE OF CHANGE CALCULATION =====
+      local time_at_this_gate = physical_time_ms / 1000.0
       if last_gate_delta_value ~= nil and type(time_at_this_gate) == "number" and type(time_at_last_gate) == "number" then
         local change_in_time = time_at_this_gate - time_at_last_gate
         if change_in_time > 0.01 then
@@ -695,26 +732,39 @@ local function checkGateCrossing(dt)
     
     last_gate_crossed_index = found_gate_index
   else
-    if last_gate_crossed_index > 0 then
-      local primary_gate_to_check = current_route.gates[next_gate_index]
+    -- OFF-ROUTE / RESET LOGIC
+    if (last_gate_crossed_index > 0 or next(preemptive_timers) ~= nil) and #current_route.gates > 0 then
+      local next_gate_to_check_index = last_gate_crossed_index + 1
+      if next_gate_to_check_index > #current_route.gates then return end
+      local primary_gate_to_check = current_route.gates[next_gate_to_check_index]
+
       local gate_center_x = (primary_gate_to_check.p1.x + primary_gate_to_check.p2.x) / 2
       local gate_center_z = (primary_gate_to_check.p1.z + primary_gate_to_check.p2.z) / 2
       local dist_to_gate = math.sqrt((current_pos_vec3.x - gate_center_x)^2 + (current_pos_vec3.z - gate_center_z)^2)
       
       if dist_to_gate > 200 then
-        ac.log("Off route! Distance to next gate is > 200m. Resetting delta.")
+        ac.log("Off route or reset detected! Distance to next gate is > 200m. Resetting lap state.")
+        
         last_gate_crossed_index = 0
         current_run_gate_splits = {}
         ui_gate_delta_text = "Current Lap Delta: -.--"
         ui_gate_delta_color = nil
         live_delta_value = nil
         live_delta_color = nil
-        -- Note: The old lap_start_to_gate_1_timer reset is no longer needed here.
         
         last_gate_delta_value = nil
         time_at_last_gate = 0.0
         delta_rate_of_change = nil
         smoothed_delta_rate_of_change = 0.0
+
+        preemptive_timers = {}
+        current_route = { name = "", gates = {} }
+        active_route_gates = {}
+        manual_lap_timer = 0.0
+
+        if current then
+          current.track = ""
+        end
       end
     end
   end
@@ -855,56 +905,43 @@ local function snapshotActivePB(trackName)
 end
 
 -- ===== Parser (fed by chat hook) =====
+-- ===== Parser (fed by chat hook) =====
 local function feed(msg)
   if not msg or msg=="" then return end
 
   -- Started timing of <track>
   local trk = msg:match("^Started%s+timing%s+of%s+(.+)$")
   if trk then
-
     if auto_placement_active then
       ac.log("Ignoring lap start trigger while auto-placement is active.")
       return
     end
 
-    -- ===== NEW: Pre-emptive Sync Logic =====
-    local startTimeOffset = 0.0
-    local preemptive_timer_data = preemptive_timers[trk]
-    if preemptive_timer_data then
-      local currentTime = os.preciseClock()
-      startTimeOffset = currentTime - preemptive_timer_data.startTime
-      ac.log(string.format("[Triggers] CONFIRMED! Using pre-emptive start for '%s'. Offset: %.3fs", trk, startTimeOffset))
-      -- IMPORTANT: Clear all pending timers now that we've committed to a lap
-      preemptive_timers = {}
-    else
-      ac.log("[Triggers] No pre-emptive timer found for '" .. trk .. "'. Starting timer from zero (high ping may affect first split).")
-    end
-    -- =======================================
-    -- ===== AUTOMATIC ROUTE LOADING LOGIC =====
-    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
-    local filepath = app_folder .. 'routes/' .. trk .. '.json'
-    local route_json_string = io.load(filepath)
-    
-    if route_json_string then
-      ac.log("Found matching route file for '" .. trk .. "'. Loading gates.")
-      -- Load the route data into our 'current_route' editor variable
-      -- This ensures that if the user opens the editor, the active route is shown
-      current_route = json.decode(route_json_string)
-    else
-      ac.log("No matching route file found for '" .. trk .. "'. Gate delta system will be inactive.")
-      -- If no file is found, clear out any previously loaded route and set gates to empty
-      current_route = { name = trk, gates = {} }
-    end
-    -- ==========================================
+    if preemptive_timers[trk] then
+        ac.log(string.format("[Triggers] CONFIRMED! Provisional lap for '%s' is now official.", trk))
+        current.track = trk
+        preemptive_timers = {}
+        snapshotActivePB(trk)
+    elseif not (current.track and current.track ~= "") then
+        ac.log("[Triggers] No provisional lap active for '" .. trk .. "'. Starting timer from message.")
+        
+        local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+        local filepath = app_folder .. 'routes/' .. trk .. '.json'
+        local route_json_string = io.load(filepath)
+        if route_json_string then
+          current_route = json.decode(route_json_string)
+        else
+          current_route = { name = trk, gates = {} }
+        end
 
-    -- We now trigger our gate lap start logic using the loaded route's name
-    startNewGateLap(current_route.name, startTimeOffset)
-    
-    -- We also still need to handle the legacy server sector part of the app
-    if (current.lap or #current.secs>0) then last = cloneLap(current) end
-    current = newLapState(); current.track = trk
-    snapshotActivePB(trk)
-
+        ac.log("[TIMER_DEBUG] SERVER FALLBACK: No physical trigger was active. Starting timer from server message for '" .. trk .. "'.")
+        
+        startNewGateLap(current_route.name)
+        current.track = trk
+        snapshotActivePB(trk)
+    else
+        ac.log(string.format("Ignoring server start for '%s' because lap for '%s' is already active.", trk, current.track))
+    end
     return
   end
   
@@ -923,7 +960,6 @@ local function feed(msg)
       table.insert(current.inv,  inval)
       local idx = #current.secs
       
-      -- === THIS IS THE NEW BLOCK TO ADD ===
       -- Update Session Best Sector
       if not inval or settings.countInvalids then
         local trackKey = toKey(current.track)
@@ -932,7 +968,6 @@ local function feed(msg)
           sessionBestSecs[trackKey][idx] = secT
         end
       end
-      -- === END OF NEW BLOCK ===
 
       local updated = updBestSector(toKey(current.track), idx, secT, inval)
       if updated then current.pbNew[idx] = true end
@@ -952,15 +987,14 @@ local function feed(msg)
       local lapInvalidFromServer = msg:find("%(invalid%)") ~= nil
       local lapT  = (tonumber(m) or 0)*60 + (tonumber(s) or 0)
       current.lap, current.lapInv = lapT, lapInvalidFromServer
+      
       local target = sectorCountFor(current.track)
-      -- [ logic for calculating final sector, etc. ]
       if #current.secs < target and #current.secs >= 1 then
         local computed = math.max(0, lapT - sum(current.secs))
         local finalInv = anyTrue(current.inv, target-1) or lapInvalidFromServer
         current.secs[target] = computed
         current.inv[target]  = finalInv
 
-        -- === FIX 1: ADD THIS BLOCK TO UPDATE SESSION BEST SECTOR FOR THE FINAL SECTOR ===
         if not finalInv or settings.countInvalids then
           local trackKey = toKey(current.track)
           sessionBestSecs[trackKey] = sessionBestSecs[trackKey] or {}
@@ -969,7 +1003,6 @@ local function feed(msg)
           end
         end
 
-
         updBestSector(toKey(current.track), target, computed, finalInv)
       elseif #current.secs == target then
         current.inv[target] = (current.inv[target] or false) or anyTrue(current.inv, target-1) or lapInvalidFromServer
@@ -977,13 +1010,11 @@ local function feed(msg)
         for i=target+1,#current.secs do current.secs[i]=nil; current.inv[i]=nil; current.pbNew[i]=nil end
       end
 
-      -- === NEW LOGIC: ALWAYS UPDATE SESSION PB ===
       last = cloneLap(current)
       if #last.secs == target then
         local trackKey = toKey(last.track)
         local sbl = sessionBestLap[trackKey]
         
-        -- THE FIX IS HERE: Re-introduce the 'countInvalids' check
         local shouldUpdate = (not last.lapInv or settings.countInvalids)
         
         if shouldUpdate and (not sbl or last.lap < sbl.lap) then
@@ -992,81 +1023,63 @@ local function feed(msg)
         end
       end
       
-      -- ===== AUTOSAVE & DELTA LOGIC (FINAL, CORRECTED VALIDITY) =====
+      -- ===== NEW: AUTOSAVE & DELTA LOGIC WITH NEW FORMAT =====
       if #active_route_gates > 0 then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
         
-        -- Create a final, complete set of splits for this lap, finalized with the server's time.
-        local completed_splits = cloneTable(current_run_gate_splits)
-        completed_splits[#active_route_gates] = official_lap_ms
-
-        -- NEW: Separate validity checks for Session and All-Time PBs
+        -- The completed lap data stores PURE PHYSICAL splits and the OFFICIAL server time.
+        local completed_lap_data = {
+          gateSplits = cloneTable(current_run_gate_splits),
+          lapMS = official_lap_ms,
+          serverSectors = cloneTable(last.secs)
+        }
+        
         local isLapValidForSessionPB = (not last.lapInv or settings.countInvalids)
-        local isLapValidForAllTimePB = not last.lapInv -- This check is strict and ignores the setting.
-
-        -- === Part 1: Update Session PB ===
+        local isLapValidForAllTimePB = not last.lapInv
+        
+        -- Part 1: Update Session PB - Compares official time vs official time
         if isLapValidForSessionPB then
-          local current_session_pb_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey][#active_route_gates]) or nil
+          local current_session_pb_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey].lapMS) or nil
           if not current_session_pb_ms or official_lap_ms < current_session_pb_ms then
-            ac.log("New Session Best for '" .. last.track .. "'. (Lap validity: " .. tostring(not last.lapInv) .. ", Setting allows invalid: " .. tostring(settings.countInvalids) .. ")")
-            sessionBestGateSplits[trackKey] = completed_splits
+            ac.log("New Session Best for '" .. last.track .. "'.")
+            sessionBestGateSplits[trackKey] = completed_lap_data
           end
-        else
-            ac.log("Lap is invalid and setting is off. Skipping Session PB check.")
         end
         
-        -- === Part 2: Update All-Time PB & Save to Disk (Strict Check) ===
+        -- Part 2: Update All-Time PB & Save to Disk - Compares official time vs official time
         if isLapValidForAllTimePB then
-          local current_all_time_pb_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey][#active_route_gates]) or nil
+          local current_all_time_pb_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey].lapMS) or nil
           if not current_all_time_pb_ms or official_lap_ms < current_all_time_pb_ms then
             ac.log("New All-Time Best for '" .. last.track .. "'. Preparing to save.")
-            bestGateSplits[trackKey] = completed_splits
+            bestGateSplits[trackKey] = completed_lap_data
             
-            -- Save the new All-Time PB to a file. This block is now only reachable by valid laps.
-            
-            local carKey, carLabel = getCarKeyAndLabel() -- Corrected function name
+            local carKey, carLabel = getCarKeyAndLabel()
             local payload = {
-              id = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
-              schema = 2,
+              schema = 2, -- New schema version
               loopName = last.track,
               loopKey = trackKey,
               carKey = carKey,
               carLabel = carLabel,
-              gateCount = #completed_splits,
-              gateSplits = completed_splits,
-              serverSectors = cloneTable(last.secs),
-              lapMS = official_lap_ms,
+              gateCount = #completed_lap_data.gateSplits,
+              gateSplits = completed_lap_data.gateSplits,
+              serverSectors = completed_lap_data.serverSectors,
+              lapMS = completed_lap_data.lapMS,
               created = os.time()
             }
             saveBestLapForPair(payload)
-
             show_pb_notification = true
             pb_notification_route_name = last.track
-            -- END OF NEW BLOCK
-
           end
-        else
-            ac.log("Lap is invalid. Skipping All-Time PB check and disk save.")
         end
       end
       
-      -- This part remains the same: reset state for the next lap.
+      -- Reset state for the next potential lap.
       local trackName = last.track
       current = newLapState()
-      current.track = trackName
+      current.track = "" -- CRUCIAL: Allow the next trigger to fire
       snapshotActivePB(trackName)
-
-      -- ===== NEW: IMMEDIATE STATE RESET =====
-      -- We explicitly reset all live timing variables
-      -- the moment a lap is confirmed as finished. This prevents any old
-      -- timer values from carrying over to the next lap attempt.
-      ac.log("Lap finished. Resetting live timing state immediately.")
-      manual_lap_timer = 0.0
-      last_gate_crossed_index = 0
-      current_run_gate_splits = {}
-      last_pos = nil -- This forces re-initialization on the next frame
-      -- ======================================
+      resetProvisionalLapState()
       
       return
     end
@@ -1078,18 +1091,18 @@ ac.onChatMessage(function(message, senderCarIndex)
   if senderCarIndex == -1 then
     local msg_str = tostring(message or "")
 
-    if __SIMULATE_MESSAGE_DELAY and not pending_message_data then
-      if msg_str:find("Started timing") or msg_str:find("Lap time") or msg_str:find("Sector time") then
-        local delay = MIN_DELAY + math.random() * (MAX_DELAY - MIN_DELAY)
-        local process_at = os.preciseClock() + delay -- THE FIX: Use os.preciseClock()
-        
-        pending_message_data = { message = msg_str, process_at = process_at }
-        
-        ac.log(string.format("[DEBUG DELAY] Intercepted server message. Will process in %.2f seconds.", delay))
-      else
-        feed(msg_str)
-      end
+    -- REVISED SIMULATION LOGIC
+    if __SIMULATE_MESSAGE_DELAY and (msg_str:find("Started timing") or msg_str:find("Lap time") or msg_str:find("Sector time")) then
+      -- If the simulation is on, ALWAYS intercept the relevant message types.
+      -- Overwriting a pending message is the correct behavior for a rapid reset scenario.
+      local delay = MIN_DELAY + math.random() * (MAX_DELAY - MIN_DELAY)
+      local process_at = os.preciseClock() + delay
+      
+      pending_message_data = { message = msg_str, process_at = process_at }
+      
+      ac.log(string.format("[DEBUG DELAY] Intercepted/Overwrote server message. Will process in %.2f seconds.", delay))
     else
+      -- Process immediately if simulation is off OR it's a message type we don't delay.
       feed(msg_str)
     end
   end
@@ -1313,10 +1326,18 @@ function windowMain(dt)
   end
 
   cleanupExpiredPreemptiveTimers(dt)
-  
-  checkTriggerGateCrossings(dt)
 
+  checkTriggerGateCrossings(dt)
+  
   checkGateCrossing(dt)
+
+  do
+  local owncar = ac.getCar(0)
+  if owncar and owncar.position then
+    local p = owncar.position
+    last_pos = { x = p.x, y = p.y, z = p.z }
+  end
+end
 
    -- If the MAIN reference mode changed (Session vs All-Time), resnapshot immediately
   if lastRefToggle ~= settings.useSessionPB then
