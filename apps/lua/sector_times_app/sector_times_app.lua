@@ -11,7 +11,7 @@ local defaults = {
   showBackground  = true,
   countInvalids   = true,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical) -- ADD THIS LINE
-  auto_placement_interval = 1.0, -- ADD THIS LINE (default to 1 second)
+  auto_placement_interval = 1.0, --(default to 1 second)
   
 }
 local settings = ac.storage(defaults)
@@ -21,6 +21,23 @@ local gate_editor_active = false -- a flag to know when to draw gates on a map (
 local current_route = { name = "", gates = {} }
 local GATE_WIDTH = 30.0 -- Default gate width in meters
 local gate_debounce_timer = 0.0
+
+-- ===== NEW: Trigger Gate State & Persistence =====
+local trigger_gates = {} -- { ["Route Name"] = { p1 = {x,z}, p2 = {x,z} } }
+local TRIGGER_GATES_FILE = "trigger_gates.json"
+-- ===============================================
+
+-- ===== NEW: Pre-emptive Timing State =====
+local preemptive_timers = {} -- { ["Route Name"] = { startTime = <seconds>, expiryTime = <seconds> } }
+local PREEMPTIVE_TIMEOUT = 2.0 -- How long to wait for a server message after a trigger crossing
+local trigger_gate_debounce = 0.0
+
+-- ===== NEW: Debug State for Simulating Message Delay =====
+local __SIMULATE_MESSAGE_DELAY = false
+local MIN_DELAY = 1.0 -- seconds
+local MAX_DELAY = 3.0 -- seconds
+local pending_message_data = nil -- { message = "...", process_at = <sim_time_in_seconds> }
+-- =======================================
 
 
 -- NEW: State for automatic gate placement
@@ -127,6 +144,7 @@ local lastSessionRefToggle = settings.refBestSectors
 
 local _saved_pbs_loaded = false
 local _initial_pbs_loaded = false
+local _trigger_gates_loaded = false
 
 -- ===== Saving system (per loop + car) =====
 
@@ -158,6 +176,33 @@ end
 
 local SAVE_INDEX_FILE = 'saved_laps_index.json'  -- index kept in app root for simplicity
 --local saveIndex = { items = {}, schema = 1 }
+
+local function saveTriggerGates()
+  local path = appPath(TRIGGER_GATES_FILE)
+  io.save(path, json.encode(trigger_gates))
+  ac.log("[Triggers] Saved trigger gates to file.")
+end
+
+local function loadTriggerGates()
+  local path = appPath(TRIGGER_GATES_FILE)
+  if io.fileExists(path) then
+    local raw = io.load(path)
+    if raw then
+      local ok, data = pcall(json.decode, raw)
+      if ok and type(data) == 'table' then
+        trigger_gates = data
+        -- A simple helper to count keys in a table
+        local count = 0
+        for _ in pairs(trigger_gates) do count = count + 1 end
+        ac.log("[Triggers] Loaded " .. count .. " trigger gates.")
+      else
+        ac.log("[Triggers] Failed to decode trigger gates file.")
+      end
+    end
+  else
+    ac.log("[Triggers] No trigger gates file found. Starting with an empty set.")
+  end
+end
 
 -- NEW SAVE FUNCTION: Overwrites the PB file for a specific loop/car pair.
 local function saveBestLapForPair(payload)
@@ -353,29 +398,21 @@ end
 function script.init()
   -- This function is called once when the script loads.
   loadSaveIndex()
+  
 end
 
 -- ===== Helpers =====
 --local function toKey(name) return (name or ""):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
 
-local function startNewGateLap(trackName)
-  -- Get the current server traffic type
+local function startNewGateLap(trackName, startTimeOffset)
+  startTimeOffset = startTimeOffset or 0.0 -- Default to 0 if not provided
+
   local trafficType = getServerTrafficType()
-  -- Create a user-friendly version for the log message
-  local displayType = "Unknown"
-  if trafficType == "traffic" then
-    displayType = "Traffic"
-  elseif trafficType == "notraffic" then
-    displayType = "No Traffic"
-  end
+  local displayType = (trafficType == "traffic" and "Traffic") or (trafficType == "notraffic" and "No Traffic") or "Unknown"
 
-  -- THE MODIFIED LINE: Include the traffic type in the log message
-  ac.log(string.format("Starting new gate lap for: %s [%s]", trackName, displayType))
+  ac.log(string.format("Starting new gate lap for: %s [%s] | Offset: %.3fs", trackName, displayType, startTimeOffset))
   
-  -- The active gates are now taken from the globally loaded 'current_route'
   active_route_gates = current_route.gates
-
-  -- This is the same logic from the 'feed' function's lap start hook
   local trackKey = toKey(trackName)
 
   if settings.useSessionPB then
@@ -391,12 +428,12 @@ local function startNewGateLap(trackName)
 
   ac.log("Loaded " .. #active_gate_pb .. " PB gate splits.")
 
-  -- Reset all gate-related states for the new lap
+   -- Reset all gate-related states for the new lap
   last_gate_crossed_index = 0
   last_pos = nil 
-  manual_lap_timer = 0.0
+  manual_lap_timer = startTimeOffset -- THE KEY CHANGE: Start timer with the offset
   gate_debounce_timer = 0.0
-  lap_start_to_gate_1_timer = 0.0
+  -- lap_start_to_gate_1_timer = 0.0 -- OLD TIMER: We no longer need this
   current_run_gate_splits = {}
   
   -- NEW: Reset delta rate of change state
@@ -455,6 +492,56 @@ local function lines_intersect(p1, p2, p3, p4)
   return t > 0 and t < 1 and u > 0 and u < 1
 end
 
+local function cleanupExpiredPreemptiveTimers(dt)
+  local currentTime = os.preciseClock() -- THE FIX: Use os.preciseClock()
+  local to_delete = {}
+  for routeName, timerData in pairs(preemptive_timers) do
+    if currentTime > timerData.expiryTime then
+      table.insert(to_delete, routeName)
+    end
+  end
+
+  if #to_delete > 0 then
+    for _, routeName in ipairs(to_delete) do
+      preemptive_timers[routeName] = nil
+      ac.log("[Triggers] Expired pre-emptive timer for '" .. routeName .. "' removed.")
+    end
+  end
+end
+
+local function checkTriggerGateCrossings(dt)
+  trigger_gate_debounce = math.max(0, trigger_gate_debounce - dt)
+  if trigger_gate_debounce > 0 then return end
+
+  if not last_pos then return end
+  
+  local owncar = ac.getCar(0)
+  if not owncar or not owncar.position then return end
+  local current_pos_vec3 = owncar.position
+  
+  for routeName, gate in pairs(trigger_gates) do
+    if not preemptive_timers[routeName] then
+      local gate_p1 = gate.p1; local gate_p2 = gate.p2
+      local gate_vec = {x = gate_p2.x - gate_p1.x, z = gate_p2.z - gate_p1.z}
+      local vec_to_last = {x = last_pos.x - gate_p1.x, z = last_pos.z - gate_p1.z}
+      local side_last = gate_vec.x * vec_to_last.z - gate_vec.z * vec_to_last.x
+      local vec_to_current = {x = current_pos_vec3.x - gate_p1.x, z = current_pos_vec3.z - gate_p1.z}
+      local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
+      
+      if side_last < 0 and side_current >= 0 then
+        ac.log("[Triggers] Pre-emptive trigger crossed for: " .. routeName)
+        local currentTime = os.preciseClock() -- THE FIX: Use os.preciseClock()
+        preemptive_timers[routeName] = {
+          startTime = currentTime,
+          expiryTime = currentTime + PREEMPTIVE_TIMEOUT
+        }
+        trigger_gate_debounce = 0.5
+        break
+      end
+    end
+  end
+end
+
 
 local function checkGateCrossing(dt)
   -- ===== AUTO-PLACEMENT LOGIC (unchanged) =====
@@ -479,20 +566,21 @@ local function checkGateCrossing(dt)
   end
   -- ==========================================================
 
-  if lap_start_to_gate_1_timer >= 0 then
-    lap_start_to_gate_1_timer = lap_start_to_gate_1_timer + dt
-  end
-
   gate_debounce_timer = math.max(0, gate_debounce_timer - dt)
+
+  -- NEW CUMULATIVE TIMER LOGIC
+  -- Only increment the lap timer if a lap is officially active.
+  -- The server "feed" function's call to startNewGateLap is our start signal.
+  -- `current.track` being set is the best indicator of an active lap.
+  if current.track and current.track ~= "" then
+    manual_lap_timer = manual_lap_timer + dt
+  end
+  
   if #current_route.gates == 0 then return end
 
   local owncar = ac.getCar(0)
   if not owncar or not owncar.position then return end
   local current_pos_vec3 = owncar.position
-  
-  if last_gate_crossed_index > 0 or lap_start_to_gate_1_timer >= 0 then
-    manual_lap_timer = manual_lap_timer + dt
-  end
   
   if not last_pos then
     last_pos = {x = current_pos_vec3.x, y = current_pos_vec3.y, z = current_pos_vec3.z}
@@ -519,7 +607,7 @@ local function checkGateCrossing(dt)
         found_gate_index = i
         break
       else
-        ac.log(string.format("[Gate #%d] CROSSED FROM WRONG SIDE. Ignored. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
+        --ac.log(string.format("[Gate #%d] CROSSED FROM WRONG SIDE. Ignored. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
       end
     end
   end
@@ -528,37 +616,24 @@ local function checkGateCrossing(dt)
     ac.log("[DEBUG] Intercepted crossing of Gate #5. Forcing a skip to #7.")
     found_gate_index = 7 -- Pretend we just crossed gate 7 instead of 5
   end
-  -- END OF DEBUG BLOCK
   
   if found_gate_index ~= -1 then
     gate_debounce_timer = 0.1
-    local time_at_found_gate_ms
+    -- SIMPLIFIED: The cumulative time is simply the current value of our single lap timer.
+    local time_at_found_gate_ms = manual_lap_timer * 1000
 
-    -- First, calculate the total time to the gate that was actually crossed.
-    if found_gate_index == 1 then
-      time_at_found_gate_ms = lap_start_to_gate_1_timer * 1000
-    else
-      local split_zero_time_ms = current_run_gate_splits[1] or 0
-      time_at_found_gate_ms = split_zero_time_ms + (manual_lap_timer * 1000)
-    end
-
-    -- === NEW: SKIPPED GATE INTERPOLATION LOGIC ===
+    -- === SKIPPED GATE INTERPOLATION LOGIC (unchanged) ===
     local expected_gate_index = last_gate_crossed_index + 1
     if found_gate_index > expected_gate_index then
       ac.log(string.format("[Gate Interpolation] Skipped gates %d through %d. Interpolating times.", expected_gate_index, found_gate_index - 1))
 
-      -- Get the time and index of the last valid gate crossing
       local start_index = last_gate_crossed_index
       local start_time = (start_index > 0 and current_run_gate_splits[start_index]) or 0
-
-      -- Define the time and index for the gate we just crossed
       local end_index = found_gate_index
       local end_time = time_at_found_gate_ms
-
       local time_diff = end_time - start_time
       local index_diff = end_index - start_index
 
-      -- Loop through the gates that were missed and add an interpolated time for each
       for i = start_index + 1, end_index - 1 do
         local progress = (i - start_index) / index_diff
         local interpolated_time = start_time + (time_diff * progress)
@@ -566,27 +641,21 @@ local function checkGateCrossing(dt)
         ac.log(string.format("  -> Interpolated Gate #%d at %s", i, fmtMS(interpolated_time)))
       end
     end
-    -- === END OF NEW LOGIC ===
+    -- === END OF INTERPOLATION LOGIC ===
 
     -- Now, add the actual, measured time for the gate that was crossed.
     table.insert(current_run_gate_splits, time_at_found_gate_ms)
 
-    -- Reset timers if this was the first gate crossing of the lap.
-    if found_gate_index == 1 then
-      lap_start_to_gate_1_timer = -1.0
-      manual_lap_timer = 0.0
-    end
+    -- NOTE: The old timer reset logic for Gate 1 has been removed. The timer is never reset.
     
-    -- The delta calculation can now proceed, confident that the array is correctly structured.
-    local total_time_ms = time_at_found_gate_ms -- Use this for the delta calc
-    
+    local total_time_ms = time_at_found_gate_ms
     local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
+    
     if pb_split_total_time then
       local delta = (total_time_ms - pb_split_total_time) / 1000.0
       
-      -- ===== DELTA RATE OF CHANGE CALCULATION WITH SMOOTHING & FIX =====
+      -- ===== DELTA RATE OF CHANGE CALCULATION (unchanged) =====
       local time_at_this_gate = total_time_ms / 1000.0
-      
       if last_gate_delta_value ~= nil and type(time_at_this_gate) == "number" and type(time_at_last_gate) == "number" then
         local change_in_time = time_at_this_gate - time_at_last_gate
         if change_in_time > 0.01 then
@@ -604,7 +673,6 @@ local function checkGateCrossing(dt)
          smoothed_delta_rate_of_change = nil
       end
       
-      -- Update state for the next gate crossing
       last_gate_delta_value = delta
       time_at_last_gate = time_at_this_gate
       -- ===============================================
@@ -641,7 +709,7 @@ local function checkGateCrossing(dt)
         ui_gate_delta_color = nil
         live_delta_value = nil
         live_delta_color = nil
-        lap_start_to_gate_1_timer = -1.0
+        -- Note: The old lap_start_to_gate_1_timer reset is no longer needed here.
         
         last_gate_delta_value = nil
         time_at_last_gate = 0.0
@@ -798,6 +866,20 @@ local function feed(msg)
       ac.log("Ignoring lap start trigger while auto-placement is active.")
       return
     end
+
+    -- ===== NEW: Pre-emptive Sync Logic =====
+    local startTimeOffset = 0.0
+    local preemptive_timer_data = preemptive_timers[trk]
+    if preemptive_timer_data then
+      local currentTime = os.preciseClock()
+      startTimeOffset = currentTime - preemptive_timer_data.startTime
+      ac.log(string.format("[Triggers] CONFIRMED! Using pre-emptive start for '%s'. Offset: %.3fs", trk, startTimeOffset))
+      -- IMPORTANT: Clear all pending timers now that we've committed to a lap
+      preemptive_timers = {}
+    else
+      ac.log("[Triggers] No pre-emptive timer found for '" .. trk .. "'. Starting timer from zero (high ping may affect first split).")
+    end
+    -- =======================================
     -- ===== AUTOMATIC ROUTE LOADING LOGIC =====
     local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
     local filepath = app_folder .. 'routes/' .. trk .. '.json'
@@ -816,7 +898,7 @@ local function feed(msg)
     -- ==========================================
 
     -- We now trigger our gate lap start logic using the loaded route's name
-    startNewGateLap(current_route.name)
+    startNewGateLap(current_route.name, startTimeOffset)
     
     -- We also still need to handle the legacy server sector part of the app
     if (current.lap or #current.secs>0) then last = cloneLap(current) end
@@ -974,6 +1056,17 @@ local function feed(msg)
       current = newLapState()
       current.track = trackName
       snapshotActivePB(trackName)
+
+      -- ===== NEW: IMMEDIATE STATE RESET =====
+      -- We explicitly reset all live timing variables
+      -- the moment a lap is confirmed as finished. This prevents any old
+      -- timer values from carrying over to the next lap attempt.
+      ac.log("Lap finished. Resetting live timing state immediately.")
+      manual_lap_timer = 0.0
+      last_gate_crossed_index = 0
+      current_run_gate_splits = {}
+      last_pos = nil -- This forces re-initialization on the next frame
+      -- ======================================
       
       return
     end
@@ -982,15 +1075,25 @@ end
 
 -- ===== Chat hook =====
 ac.onChatMessage(function(message, senderCarIndex)
-  -- Only process the message if it comes from the server (senderCarIndex == -1).
-  -- This prevents players from manually typing chat messages to trigger fake times.
-  
-
   if senderCarIndex == -1 then
-    feed(tostring(message or ""))
+    local msg_str = tostring(message or "")
+
+    if __SIMULATE_MESSAGE_DELAY and not pending_message_data then
+      if msg_str:find("Started timing") or msg_str:find("Lap time") or msg_str:find("Sector time") then
+        local delay = MIN_DELAY + math.random() * (MAX_DELAY - MIN_DELAY)
+        local process_at = os.preciseClock() + delay -- THE FIX: Use os.preciseClock()
+        
+        pending_message_data = { message = msg_str, process_at = process_at }
+        
+        ac.log(string.format("[DEBUG DELAY] Intercepted server message. Will process in %.2f seconds.", delay))
+      else
+        feed(msg_str)
+      end
+    else
+      feed(msg_str)
+    end
   end
   
-  -- We always return false so the message still appears in the regular chat app.
   return false
 end)
 
@@ -1068,40 +1171,51 @@ local function drawLapBlock(title, lap, opts)
 end
 
 local function drawDebugGates()
-  if #current_route.gates == 0 then return end
+  -- Draw the gates for the currently loaded route (if any)
+  if #current_route.gates > 0 then
+    local owncar = ac.getCar(0)
+    if not owncar or not owncar.position then return end
+    
+    local GATE_HEIGHT = 0.5
+    local COL_START_FINISH = rgbm(0.2, 0.8, 0.2, 0.6)
+    local COL_NEXT_GATE    = rgbm(0.8, 0.8, 0.2, 0.8)
+    local COL_NORMAL_GATE  = rgbm(0.4, 0.6, 1.0, 0.5)
 
-  local owncar = ac.getCar(0)
-  if not owncar or not owncar.position then return end
-  
-  -- Configuration for the visual gates
-  local GATE_HEIGHT = 0.5 -- NEW: Much smaller height for thin strips (in meters)
-  local COL_START_FINISH = rgbm(0.2, 0.8, 0.2, 0.6) -- Green (slightly less transparent)
-  local COL_NEXT_GATE    = rgbm(0.8, 0.8, 0.2, 0.8) -- Yellow (less transparent)
-  local COL_NORMAL_GATE  = rgbm(0.4, 0.6, 1.0, 0.5) -- Blue (less transparent)
+    local car_pos = owncar.position
+    local next_gate_to_cross = last_gate_crossed_index + 1
 
-  local car_pos = owncar.position
-  local next_gate_to_cross = last_gate_crossed_index + 1
+    for i, gate in ipairs(current_route.gates) do
+      local color = COL_NORMAL_GATE
+      if i == 1 then color = COL_START_FINISH end
+      if i == next_gate_to_cross then color = COL_NEXT_GATE end
 
-  for i, gate in ipairs(current_route.gates) do
-    local color = COL_NORMAL_GATE
-    if i == 1 then
-      color = COL_START_FINISH
-    elseif i == next_gate_to_cross then
-      color = COL_NEXT_GATE
+      local ground_y = car_pos.y
+      local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)
+      local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)
+      local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z)
+      local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z)
+      render.quad(corner_bl, corner_br, corner_tr, corner_tl, color)
     end
+  end
 
-    -- NEW SIMPLIFIED LOGIC:
-    -- Use the car's current Y-position as the base for all gates.
+  -- NEW: Draw all global trigger gates in a distinct color
+  do
+    local owncar = ac.getCar(0)
+    if not owncar or not owncar.position then return end
+
+    local GATE_HEIGHT = 0.5
+    local COL_TRIGGER_GATE = rgbm(1.0, 0.2, 0.8, 0.7) -- Bright Magenta
+
+    local car_pos = owncar.position
     local ground_y = car_pos.y
 
-    -- Define the 4 corners of the rectangular plane using the new height
-    local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)       -- Bottom-Left
-    local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)       -- Bottom-Right
-    local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z) -- Top-Right
-    local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z) -- Top-Left
-
-    -- Draw the quad
-    render.quad(corner_bl, corner_br, corner_tr, corner_tl, color)
+    for routeName, gate in pairs(trigger_gates) do
+      local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)
+      local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)
+      local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z)
+      local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z)
+      render.quad(corner_bl, corner_br, corner_tr, corner_tl, COL_TRIGGER_GATE)
+    end
   end
 end
 
@@ -1143,7 +1257,26 @@ local DeltaFont = ui.DWriteFont('Arial', './data')
 
 function windowMain(dt)
 
-  -- NEW: LAZY-LOADING FOR SAVED PBs
+  -- ===== NEW: Process Delayed Message =====
+  if pending_message_data then
+    local current_time = os.preciseClock() -- THE FIX: Use os.preciseClock()
+    if current_time >= pending_message_data.process_at then
+      ac.log("[DEBUG DELAY] Processing delayed message now.")
+      feed(pending_message_data.message)
+      pending_message_data = nil -- Clear it so we can accept the next one
+    end
+  end
+  -- ======================================
+
+  -- LAZY-LOADING FOR TRIGGER GATES
+  -- This runs only ONCE on the first frame the UI is active.
+  if not _trigger_gates_loaded then
+    _trigger_gates_loaded = true -- Set flag immediately to prevent re-running
+    ac.log("[Triggers] UI is active. Performing initial load of trigger gates...")
+    loadTriggerGates()
+  end
+
+  -- LAZY-LOADING FOR SAVED PBs
   -- This runs only ONCE on the first frame the UI is active, guaranteeing
   -- that car and session data is available for the load functions to use.
   if not _initial_pbs_loaded then
@@ -1178,6 +1311,10 @@ function windowMain(dt)
   if settings.showDebugGates then
     drawDebugGates()
   end
+
+  cleanupExpiredPreemptiveTimers(dt)
+  
+  checkTriggerGateCrossings(dt)
 
   checkGateCrossing(dt)
 
@@ -1391,35 +1528,42 @@ local function drawGateEditor()
   ui.separator()
   ui.text("Create Gates:")
 
-  -- The "One-Click" button for adding a gate
-  if ui.button("Add Gate at Current Position") then
-    local owncar = ac.getCar(0)
-    local car_pos = owncar.position
-    
-    local forward_vec2 = vec2(owncar.look.x, owncar.look.z):normalize()
-    local side_vec2 = vec2(-forward_vec2.y, forward_vec2.x)
-    
-    local half_width = GATE_WIDTH / 2.0
-    
-    local point_a_vec2 = vec2(car_pos.x, car_pos.z) + side_vec2 * half_width
-    local point_b_vec2 = vec2(car_pos.x, car_pos.z) - side_vec2 * half_width
-    
-    local new_gate = {
-      p1 = { x = point_a_vec2.x, z = point_a_vec2.y },
-      p2 = { x = point_b_vec2.x, z = point_b_vec2.y }
-    }
-    table.insert(current_route.gates, new_gate)
-    ac.log("Gate " .. #current_route.gates .. " created for route '" .. current_route.name .. "'.")
+  -- This button now creates a trigger gate for the current route name
+  if ui.button("Add Trigger Gate for Current Route") then
+    local routeName = current_route.name
+    if routeName and routeName ~= "" then
+      local owncar = ac.getCar(0)
+      local car_pos = owncar.position
+      
+      local forward_vec2 = vec2(owncar.look.x, owncar.look.z):normalize()
+      local side_vec2 = vec2(-forward_vec2.y, forward_vec2.x)
+      
+      local half_width = GATE_WIDTH / 2.0
+      
+      local point_a_vec2 = vec2(car_pos.x, car_pos.z) + side_vec2 * half_width
+      local point_b_vec2 = vec2(car_pos.x, car_pos.z) - side_vec2 * half_width
+      
+      local new_gate = {
+        p1 = { x = point_a_vec2.x, z = point_a_vec2.y },
+        p2 = { x = point_b_vec2.x, z = point_b_vec2.y }
+      }
+      
+      -- Add or update the gate in our global table and save
+      trigger_gates[routeName] = new_gate
+      ac.log("Trigger gate created/updated for route '" .. routeName .. "'.")
+      saveTriggerGates()
+    else
+      ac.log("Cannot add trigger gate: Route Name is empty.")
+    end
   end
 
   -- Slider to configure gate width
   GATE_WIDTH = ui.slider("Gate Width", GATE_WIDTH, 10, 80, "%.0f m")
   ui.separator()
 
-  -- UI for managing the route
+  -- UI for managing the normal route file
   ui.text("Manage Route:")
   if ui.button("Save Route") and current_route.name ~= "" then
-    -- CORRECTED: Use json.encode to convert the table to a string
     local route_json_string = json.encode(current_route)
     local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
     io.save(app_folder .. 'routes/' .. current_route.name .. '.json', route_json_string)
@@ -1431,7 +1575,6 @@ local function drawGateEditor()
     local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
     local route_json_string = io.load(app_folder .. 'routes/' .. route_name_in_box .. '.json')
     if route_json_string then
-      -- CORRECTED: Use json.decode to convert the string back to a table
       current_route = json.decode(route_json_string)
       ac.log("Route '" .. current_route.name .. "' loaded.")
     else
@@ -1444,6 +1587,7 @@ local function drawGateEditor()
     current_route = { name = "", gates = {} }
   end
 end
+
 
 -- Separate Settings window (gear button)
 function windowSettings(dt)
@@ -1513,11 +1657,28 @@ function windowSettings(dt)
     end)
     ui.tabItem("Route Editor", function()
       if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
-    settings.showDebugGates = not settings.showDebugGates
-  end
+        settings.showDebugGates = not settings.showDebugGates
+      end
 
-  ui.separator()
+      ui.separator()
       ui.textColored("--- DEBUGGING ---", COL_YELLOW)
+
+      -- NEW: UI for controlling the delay simulation
+      if ui.checkbox("Simulate Server Message Delay", __SIMULATE_MESSAGE_DELAY) then
+        __SIMULATE_MESSAGE_DELAY = not __SIMULATE_MESSAGE_DELAY
+        if not __SIMULATE_MESSAGE_DELAY then
+          pending_message_data = nil -- Clear any pending message if we turn it off
+        end
+      end
+      if __SIMULATE_MESSAGE_DELAY then
+        ui.indent()
+        MIN_DELAY = ui.slider("Min Delay", MIN_DELAY, 0.5, 5.0, "%.1f s")
+        MAX_DELAY = ui.slider("Max Delay", MAX_DELAY, 0.5, 5.0, "%.1f s")
+        if MIN_DELAY > MAX_DELAY then MAX_DELAY = MIN_DELAY end
+        ui.unindent()
+      end
+      -- END NEW
+
       if ui.checkbox("Force Gate Skip (Test)", __FORCE_GATE_SKIP_TEST) then
         __FORCE_GATE_SKIP_TEST = not __FORCE_GATE_SKIP_TEST
         if __FORCE_GATE_SKIP_TEST then
@@ -1527,7 +1688,7 @@ function windowSettings(dt)
         end
       end
 
-  ui.separator()
+      ui.separator()
       drawGateEditor()
     end)
   end)
