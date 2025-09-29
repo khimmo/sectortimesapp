@@ -410,11 +410,13 @@ end
 -- ===== Helpers =====
 --local function toKey(name) return (name or ""):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
 
-local function startNewGateLap(trackName)
+local function startNewGateLap(trackName, startTimeOffset)
+  startTimeOffset = startTimeOffset or 0.0 -- Default to 0 if not provided
+
   local trafficType = getServerTrafficType()
   local displayType = (trafficType == "traffic" and "Traffic") or (trafficType == "notraffic" and "No Traffic") or "Unknown"
 
-  ac.log(string.format("Starting new gate lap for: %s [%s]", trackName, displayType))
+  ac.log(string.format("Starting new official lap for: %s [%s] | Offset: %.3fs", trackName, displayType, startTimeOffset))
   
   active_route_gates = current_route.gates
   local trackKey = toKey(trackName)
@@ -438,8 +440,7 @@ local function startNewGateLap(trackName)
 
   -- Reset all live timing states for the new lap
   last_gate_crossed_index = 0
-  --last_pos = nil 
-  manual_lap_timer = 0.0 -- Physical timer ALWAYS starts from zero on trigger
+  manual_lap_timer = startTimeOffset -- Start timer with the calculated offset
   gate_debounce_timer = 0.0
   current_run_gate_splits = {}
   
@@ -511,15 +512,14 @@ local function cleanupExpiredPreemptiveTimers(dt)
 end
 
 local function resetProvisionalLapState()
-  ac.log("[State] Resetting all provisional lap state.")
-  preemptive_timers = {}
+  ac.log("[State] Resetting all provisional and live lap state.")
+  --preemptive_timers = {}
   manual_lap_timer = 0.0
   current_route = { name = "", gates = {} }
   active_route_gates = {}
   last_gate_crossed_index = 0
   current_run_gate_splits = {}
   trigger_gate_debounce = 0.0
-  last_pos = nil
   -- Also clear the main lap indicator
   if current then
     current.track = ""
@@ -527,20 +527,18 @@ local function resetProvisionalLapState()
 end
 
 local function checkTriggerGateCrossings(dt)
-  -- If an official lap is already in progress, or a provisional one is waiting, do nothing.
-  if (current.track and current.track ~= "") or next(preemptive_timers) ~= nil then return end
-
+  -- This function can now run even during an official lap to catch the start of the next one.
   trigger_gate_debounce = math.max(0, trigger_gate_debounce - dt)
   if trigger_gate_debounce > 0 then return end
 
   if not last_pos then
-  local owncar = ac.getCar(0)
-  if owncar and owncar.position then
-    local p = owncar.position
-    last_pos = { x = p.x, y = p.y, z = p.z }
+    local owncar = ac.getCar(0)
+    if owncar and owncar.position then
+      local p = owncar.position
+      last_pos = { x = p.x, y = p.y, z = p.z }
+    end
+    return
   end
-  return
-end
   
   local owncar = ac.getCar(0)
   if not owncar or not owncar.position then return end
@@ -556,30 +554,13 @@ end
       local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
       
       if side_last < 0 and side_current >= 0 then
-        --ac.log("[Triggers] PROVISIONAL LAP START for: " .. routeName)
-        ac.log("[TIMER_DEBUG] PHYSICAL TRIGGER: Provisional lap started for '" .. routeName .. "'. Timer starts NOW.")
-        
+        ac.log("[Triggers] Physical trigger crossed for: '" .. routeName .. "'. Starting pre-emptive timer.")
         local currentTime = os.preciseClock()
         preemptive_timers[routeName] = {
           startTime = currentTime,
           expiryTime = currentTime + PREEMPTIVE_TIMEOUT
         }
-        
-        local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
-        local filepath = app_folder .. 'routes/' .. routeName .. '.json'
-        local route_json_string = io.load(filepath)
-        if route_json_string then
-          current_route = json.decode(route_json_string)
-          ac.log("Provisional route loaded with " .. #current_route.gates .. " gates.")
-        else
-          ac.log("Could not find route file for provisional lap. Aborting.")
-          preemptive_timers[routeName] = nil
-          return
-        end
-
-        startNewGateLap(routeName) -- This will start the manual_lap_timer
-        
-        trigger_gate_debounce = 0.5
+        trigger_gate_debounce = 0.5 -- Debounce to prevent multiple triggers on the same frame
         break
       end
     end
@@ -906,42 +887,43 @@ end
 
 -- ===== Parser (fed by chat hook) =====
 -- ===== Parser (fed by chat hook) =====
+-- ===== Parser (fed by chat hook) =====
 local function feed(msg)
   if not msg or msg=="" then return end
 
   -- Started timing of <track>
   local trk = msg:match("^Started%s+timing%s+of%s+(.+)$")
   if trk then
-    if auto_placement_active then
-      ac.log("Ignoring lap start trigger while auto-placement is active.")
+    if auto_placement_active then return end
+
+    -- This guard is crucial: only start a new lap if one is not already official.
+    if current.track and current.track ~= "" then
+      ac.log(string.format("Ignoring server start for '%s' because lap for '%s' is already official.", trk, current.track))
       return
     end
 
+    local startTimeOffset = 0.0
     if preemptive_timers[trk] then
-        ac.log(string.format("[Triggers] CONFIRMED! Provisional lap for '%s' is now official.", trk))
-        current.track = trk
-        preemptive_timers = {}
-        snapshotActivePB(trk)
-    elseif not (current.track and current.track ~= "") then
-        ac.log("[Triggers] No provisional lap active for '" .. trk .. "'. Starting timer from message.")
-        
-        local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
-        local filepath = app_folder .. 'routes/' .. trk .. '.json'
-        local route_json_string = io.load(filepath)
-        if route_json_string then
-          current_route = json.decode(route_json_string)
-        else
-          current_route = { name = trk, gates = {} }
-        end
-
-        ac.log("[TIMER_DEBUG] SERVER FALLBACK: No physical trigger was active. Starting timer from server message for '" .. trk .. "'.")
-        
-        startNewGateLap(current_route.name)
-        current.track = trk
-        snapshotActivePB(trk)
+      local currentTime = os.preciseClock()
+      startTimeOffset = currentTime - preemptive_timers[trk].startTime
+      ac.log(string.format("[Triggers] CONFIRMED! Using pre-emptive start for '%s'. Offset: %.3fs", trk, startTimeOffset))
+      preemptive_timers = {} -- We have consumed the timer for THIS lap start, so clear the table.
     else
-        ac.log(string.format("Ignoring server start for '%s' because lap for '%s' is already active.", trk, current.track))
+      ac.log("[Triggers] No pre-emptive timer found for '" .. trk .. "'. Starting timer from message (first split may be inaccurate).")
     end
+
+    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+    local filepath = app_folder .. 'routes/' .. trk .. '.json'
+    local route_json_string = io.load(filepath)
+    if route_json_string then
+      current_route = json.decode(route_json_string)
+    else
+      current_route = { name = trk, gates = {} }
+    end
+    
+    startNewGateLap(current_route.name, startTimeOffset)
+    current.track = trk
+    snapshotActivePB(trk)
     return
   end
   
@@ -1023,12 +1005,11 @@ local function feed(msg)
         end
       end
       
-      -- ===== NEW: AUTOSAVE & DELTA LOGIC WITH NEW FORMAT =====
+      -- ===== AUTOSAVE & DELTA LOGIC WITH NEW FORMAT =====
       if #active_route_gates > 0 then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
         
-        -- The completed lap data stores PURE PHYSICAL splits and the OFFICIAL server time.
         local completed_lap_data = {
           gateSplits = cloneTable(current_run_gate_splits),
           lapMS = official_lap_ms,
@@ -1038,7 +1019,7 @@ local function feed(msg)
         local isLapValidForSessionPB = (not last.lapInv or settings.countInvalids)
         local isLapValidForAllTimePB = not last.lapInv
         
-        -- Part 1: Update Session PB - Compares official time vs official time
+        -- Part 1: Update Session PB
         if isLapValidForSessionPB then
           local current_session_pb_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey].lapMS) or nil
           if not current_session_pb_ms or official_lap_ms < current_session_pb_ms then
@@ -1047,7 +1028,7 @@ local function feed(msg)
           end
         end
         
-        -- Part 2: Update All-Time PB & Save to Disk - Compares official time vs official time
+        -- Part 2: Update All-Time PB & Save to Disk
         if isLapValidForAllTimePB then
           local current_all_time_pb_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey].lapMS) or nil
           if not current_all_time_pb_ms or official_lap_ms < current_all_time_pb_ms then
@@ -1056,7 +1037,7 @@ local function feed(msg)
             
             local carKey, carLabel = getCarKeyAndLabel()
             local payload = {
-              schema = 2, -- New schema version
+              schema = 2,
               loopName = last.track,
               loopKey = trackKey,
               carKey = carKey,
@@ -1074,12 +1055,14 @@ local function feed(msg)
         end
       end
       
-      -- Reset state for the next potential lap.
-      local trackName = last.track
-      current = newLapState()
-      current.track = "" -- CRUCIAL: Allow the next trigger to fire
-      snapshotActivePB(trackName)
+      -- After saving, fully reset the state. This makes the app "idle".
+      -- If a pre-emptive timer for the next lap was created, the next
+      -- "Started timing..." message will now be able to process it.
       resetProvisionalLapState()
+      
+      -- Snapshot the PBs for the UI to show the correct [PB] time for the completed lap
+      local lastTrackName = last.track
+      snapshotActivePB(lastTrackName)
       
       return
     end
