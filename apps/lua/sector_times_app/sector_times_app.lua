@@ -10,10 +10,19 @@ local defaults = {
   showDebugGates  = false,
   showBackground  = true,
   countInvalids   = true,   -- include invalid sectors/laps in PBs?
-  refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical) -- ADD THIS LINE
+  refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
   auto_placement_interval = 1.0, --(default to 1 second)
-  
+  baseFontSize = 16.0, -- NEW: Base font size for the main UI
 }
+
+-- ===== UI =====
+
+-- NEW: Add these two lines
+local _max_label_width = 0
+local _current_item_spacing_y = 4 -- Default fallback value
+local _temp_background_on = false
+
+
 local settings = ac.storage(defaults)
 local SAVE_FOLDER = "savedtimes/"
 
@@ -117,6 +126,7 @@ local last_gate_delta_value = nil   -- The numerical delta value at the previous
 local time_at_last_gate = 0.0       -- The total lap time (in seconds) when the last gate was crossed
 local delta_rate_of_change = nil    -- The calculated rate of change (delta seconds / real seconds)
 local smoothed_delta_rate_of_change = nil -- NEW: The smoothed value for the UI bar.
+local visual_bar_rate = 0.0 -- NEW: Smoothed value for the bar's visual animation
 
 -- A constant to control how much smoothing is applied to the delta rate bar.
 -- Smaller value = more smoothing, but less responsive.
@@ -129,8 +139,9 @@ local VISUAL_SMOOTHING_SPEED = 10
 
 
 -- ===== Live delta header state (for big number at the top) =====
-local live_delta_value = nil   -- number (e.g., -0.25) ((NOT USED ANYMORE))
-local live_delta_color = nil   -- rgbm (green/yellow) chosen in gate logic ((NOT USED ANYMORE))
+local live_delta_value = nil   -- number (e.g., -0.25) 
+local live_delta_color = nil   -- rgbm (green/yellow) chosen in gate logic 
+
 
 -- Session references
 
@@ -176,7 +187,7 @@ local function appPath(rel)
 end
 
 local SAVE_INDEX_FILE = 'saved_laps_index.json'  -- index kept in app root for simplicity
---local saveIndex = { items = {}, schema = 1 }
+--local saveIndex = { items = {}, schema = 1 } -- This was commented out, keeping it that way.
 
 local function saveTriggerGates()
   local path = appPath(TRIGGER_GATES_FILE)
@@ -292,21 +303,22 @@ local function saveCurrentGateSnapshot()
     created = created
   }
 
-  -- Write snapshot file
-  io.save(appPath("savedlap_" .. id .. ".json"), json.encode(payload))
+  -- This seems to refer to a saveIndex that is commented out, so I will comment this out as well.
+  -- -- Write snapshot file
+  -- io.save(appPath("savedlap_" .. id .. ".json"), json.encode(payload))
 
-  -- Update index
-  table.insert(saveIndex.items, {
-    id = id,
-    loopKey = loopKey,
-    loopName = loopName,
-    carKey = carKey,
-    carLabel = carLabel,
-    gateCount = payload.gateCount,
-    lapMS = payload.lapMS,
-    created = created
-  })
-  saveSaveIndex()
+  -- -- Update index
+  -- table.insert(saveIndex.items, {
+  --   id = id,
+  --   loopKey = loopKey,
+  --   loopName = loopName,
+  --   carKey = carKey,
+  --   carLabel = carLabel,
+  --   gateCount = payload.gateCount,
+  --   lapMS = payload.lapMS,
+  --   created = created
+  -- })
+  -- saveSaveIndex()
 
   ac.log(string.format("Saved snapshot: %s / %s (%s)", loopName, carLabel, fmtMS(payload.lapMS)))
   return true
@@ -403,12 +415,10 @@ end
 
 function script.init()
   -- This function is called once when the script loads.
-  loadSaveIndex()
-  
+  -- loadSaveIndex() -- This was referring to a commented-out variable, commenting out.
 end
 
 -- ===== Helpers =====
---local function toKey(name) return (name or ""):lower():gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
 
 local function startNewGateLap(trackName, startTimeOffset)
   startTimeOffset = startTimeOffset or 0.0 -- Default to 0 if not provided
@@ -423,10 +433,8 @@ local function startNewGateLap(trackName, startTimeOffset)
 
   local pb_data_source = nil
   if settings.useSessionPB then
-    --ac.log("Mode: Session PB. Using session data for live delta.")
     pb_data_source = sessionBestGateSplits[trackKey]
   else
-    --ac.log("Mode: Saved PB. Using all-time data for live delta.")
     pb_data_source = bestGateSplits[trackKey]
   end
 
@@ -471,17 +479,6 @@ local function cloneLap(src)
   return t
 end
 
-local function drawColoredText(txt, col)
-  -- This log will tell us the truth. Is the color object valid or nil?
-  --ac.log("drawColoredText called. Text: '" .. tostring(txt) .. "'. Color is: " .. tostring(col))
-
-  if col then
-    ui.textColored(txt, col)
-  else
-    ui.text(txt)
-  end
-end
-
 -- Checks if two 2D line segments intersect.
 -- p1, p2 define the first segment; p3, p4 define the second.
 local function lines_intersect(p1, p2, p3, p4)
@@ -495,7 +492,7 @@ local function lines_intersect(p1, p2, p3, p4)
 end
 
 local function cleanupExpiredPreemptiveTimers(dt)
-  local currentTime = os.preciseClock() -- THE FIX: Use os.preciseClock()
+  local currentTime = os.preciseClock() 
   local to_delete = {}
   for routeName, timerData in pairs(preemptive_timers) do
     if currentTime > timerData.expiryTime then
@@ -513,21 +510,18 @@ end
 
 local function resetProvisionalLapState()
   ac.log("[State] Resetting all provisional and live lap state.")
-  --preemptive_timers = {}
   manual_lap_timer = 0.0
   current_route = { name = "", gates = {} }
   active_route_gates = {}
   last_gate_crossed_index = 0
   current_run_gate_splits = {}
   trigger_gate_debounce = 0.0
-  -- Also clear the main lap indicator
   if current then
     current.track = ""
   end
 end
 
 local function checkTriggerGateCrossings(dt)
-  -- This function can now run even during an official lap to catch the start of the next one.
   trigger_gate_debounce = math.max(0, trigger_gate_debounce - dt)
   if trigger_gate_debounce > 0 then return end
 
@@ -548,7 +542,6 @@ local function checkTriggerGateCrossings(dt)
     if not preemptive_timers[routeName] then
       local gate_p1 = gate.p1; local gate_p2 = gate.p2
       
-      -- Step 1: Check if we crossed the gate's infinite line from the correct direction.
       local gate_vec = {x = gate_p2.x - gate_p1.x, z = gate_p2.z - gate_p1.z}
       local vec_to_last = {x = last_pos.x - gate_p1.x, z = last_pos.z - gate_p1.z}
       local side_last = gate_vec.x * vec_to_last.z - gate_vec.z * vec_to_last.x
@@ -556,7 +549,6 @@ local function checkTriggerGateCrossings(dt)
       local side_current = gate_vec.x * vec_to_current.z - gate_vec.z * vec_to_current.x
       
       if side_last < 0 and side_current >= 0 then
-        -- Step 2: THE NEW, EFFICIENT CHECK. Check distance to gate center.
         local gate_center_x = (gate_p1.x + gate_p2.x) / 2
         local gate_center_z = (gate_p1.z + gate_p2.z) / 2
         local dist_sq = (current_pos_vec3.x - gate_center_x)^2 + (current_pos_vec3.z - gate_center_z)^2
@@ -579,7 +571,6 @@ end
 
 
 local function checkGateCrossing(dt)
-  -- ===== AUTO-PLACEMENT LOGIC (unchanged) =====
   if auto_placement_active then
     auto_placement_timer = auto_placement_timer + dt
     if auto_placement_timer >= settings.auto_placement_interval then
@@ -599,11 +590,9 @@ local function checkGateCrossing(dt)
     end
     return
   end
-  -- ==========================================================
 
   gate_debounce_timer = math.max(0, gate_debounce_timer - dt)
 
-  -- TIMER LOGIC: Increment timer if an official lap OR a provisional lap is active.
   if (current.track and current.track ~= "") or next(preemptive_timers) ~= nil then
     manual_lap_timer = manual_lap_timer + dt
   end
@@ -638,8 +627,6 @@ local function checkGateCrossing(dt)
       if (side_last < 0 and side_current >= 0) then
         found_gate_index = i
         break
-      else
-        --ac.log(string.format("[Gate #%d] CROSSED FROM WRONG SIDE. Ignored. (side_last: %.2f, side_current: %.2f)", i, side_last, side_current))
       end
     end
   end
@@ -653,7 +640,6 @@ local function checkGateCrossing(dt)
     gate_debounce_timer = 0.1
     local physical_time_ms = manual_lap_timer * 1000
 
-    -- === SKIPPED GATE INTERPOLATION LOGIC ===
     local expected_gate_index = last_gate_crossed_index + 1
     if found_gate_index > expected_gate_index then
       ac.log(string.format("[Gate Interpolation] Skipped gates %d through %d. Interpolating times.", expected_gate_index, found_gate_index - 1))
@@ -671,18 +657,15 @@ local function checkGateCrossing(dt)
         ac.log(string.format("  -> Interpolated Gate #%d at %s", i, fmtMS(interpolated_time)))
       end
     end
-    -- === END OF INTERPOLATION LOGIC ===
-
+   
     table.insert(current_run_gate_splits, physical_time_ms)
 
-    local total_time_ms = physical_time_ms -- Total time for delta IS the physical time
+    local total_time_ms = physical_time_ms
     local pb_split_total_time = active_gate_pb and active_gate_pb[found_gate_index] or nil
     
     if pb_split_total_time then
-      -- The delta is a direct physical vs physical comparison.
       local delta = (total_time_ms - pb_split_total_time) / 1000.0
       
-      -- ===== DELTA RATE OF CHANGE CALCULATION =====
       local time_at_this_gate = physical_time_ms / 1000.0
       if last_gate_delta_value ~= nil and type(time_at_this_gate) == "number" and type(time_at_last_gate) == "number" then
         local change_in_time = time_at_this_gate - time_at_last_gate
@@ -703,7 +686,6 @@ local function checkGateCrossing(dt)
       
       last_gate_delta_value = delta
       time_at_last_gate = time_at_this_gate
-      -- ===============================================
       
       ui_gate_delta_text = string.format("Current Lap Delta: %+.2f", delta)
       if delta < 0 then ui_gate_delta_color = COL_GREEN else ui_gate_delta_color = COL_YELLOW end
@@ -723,7 +705,6 @@ local function checkGateCrossing(dt)
     
     last_gate_crossed_index = found_gate_index
   else
-    -- OFF-ROUTE / RESET LOGIC
     if ((current.track and current.track ~= "") or next(preemptive_timers) ~= nil) and #current_route.gates > 0 then
       local next_gate_to_check_index = last_gate_crossed_index + 1
       if next_gate_to_check_index > #current_route.gates then return end
@@ -782,15 +763,6 @@ end
 
 local function anyTrue(arr, upto) local n=upto or #arr; for i=1,n do if arr[i] then return true end end return false end
 
--- robust colored text wrapper (handles CSP arg orders)
-local function textColoredCompat(txt, col)
-  if ui.textColored and col then
-    if not pcall(ui.textColored, txt, col) then
-      if not pcall(ui.textColored, col, txt) then ui.text(txt) end
-    end
-  else ui.text(txt) end
-end
-
 -- Colors
 local COL_RED    = rgbm.new(0.95, 0.55, 0.55, 1.0)  -- invalid labels
 local COL_GREEN  = rgbm.new(0.55, 0.95, 0.55, 1.0)  -- PB/ faster
@@ -798,28 +770,12 @@ local COL_YELLOW = rgbm.new(0.95, 0.85, 0.40, 1.0)  -- slower than PB
 
 -- pick color for a time by pace vs PB (≤ PB = green, > PB = yellow)
 local function paceColor(val, pbVal, pbHighlight)
-  if pbHighlight then return COL_GREEN end             -- explicit PB flag (rarely needed now)
+  if pbHighlight then return COL_GREEN end
   if pbVal and val then
     local d = val - pbVal
     if d <= 0 then return COL_GREEN else return COL_YELLOW end
   end
   return nil
-end
-
--- deltas: green for negative, yellow for positive, neutral for ~0
-local function drawDeltaInline(delta)
-  if delta == nil then return end
-  -- treat tiny deltas as zero to avoid flicker
-  if math.abs(delta) < 0.005 then
-    if ui.sameLine then ui.sameLine() end
-    ui.text(string.format(" (+%.2f)", 0))
-    return
-  end
-  local sign = (delta >= 0) and "+" or ""
-  local txt  = string.format(" (%s%.2f)", sign, delta)
-  local col  = (delta < 0) and COL_GREEN or COL_YELLOW
-  if ui.sameLine then ui.sameLine() end
-  textColoredCompat(txt, col)
 end
 
 -- update hidden PBs
@@ -863,11 +819,10 @@ local function snapshotActivePB(trackName)
           populatedCount = populatedCount + 1
         end
 
-        -- NEW CHECK: Only calculate the lap time if all sectors are present
         if populatedCount >= targetSectorCount then
           activePB.lap = sum(sbs)
         else
-          activePB.lap = nil -- Explicitly ensure lap time is nil
+          activePB.lap = nil
         end
         activePB.theoretical = true
       end
@@ -896,8 +851,6 @@ local function snapshotActivePB(trackName)
 end
 
 -- ===== Parser (fed by chat hook) =====
--- ===== Parser (fed by chat hook) =====
--- ===== Parser (fed by chat hook) =====
 local function feed(msg)
   if not msg or msg=="" then return end
 
@@ -906,7 +859,6 @@ local function feed(msg)
   if trk then
     if auto_placement_active then return end
 
-    -- This guard is crucial: only start a new lap if one is not already official.
     if current.track and current.track ~= "" then
       ac.log(string.format("Ignoring server start for '%s' because lap for '%s' is already official.", trk, current.track))
       return
@@ -952,7 +904,6 @@ local function feed(msg)
       table.insert(current.inv,  inval)
       local idx = #current.secs
       
-      -- Update Session Best Sector
       if not inval or settings.countInvalids then
         local trackKey = toKey(current.track)
         sessionBestSecs[trackKey] = sessionBestSecs[trackKey] or {}
@@ -1015,7 +966,6 @@ local function feed(msg)
         end
       end
       
-      -- ===== AUTOSAVE & DELTA LOGIC WITH NEW FORMAT =====
       if #active_route_gates > 0 then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
@@ -1029,7 +979,6 @@ local function feed(msg)
         local isLapValidForSessionPB = (not last.lapInv or settings.countInvalids)
         local isLapValidForAllTimePB = not last.lapInv
         
-        -- Part 1: Update Session PB
         if isLapValidForSessionPB then
           local current_session_pb_ms = (sessionBestGateSplits[trackKey] and sessionBestGateSplits[trackKey].lapMS) or nil
           if not current_session_pb_ms or official_lap_ms < current_session_pb_ms then
@@ -1038,7 +987,6 @@ local function feed(msg)
           end
         end
         
-        -- Part 2: Update All-Time PB & Save to Disk
         if isLapValidForAllTimePB then
           local current_all_time_pb_ms = (bestGateSplits[trackKey] and bestGateSplits[trackKey].lapMS) or nil
           if not current_all_time_pb_ms or official_lap_ms < current_all_time_pb_ms then
@@ -1065,12 +1013,8 @@ local function feed(msg)
         end
       end
       
-      -- After saving, fully reset the state. This makes the app "idle".
-      -- If a pre-emptive timer for the next lap was created, the next
-      -- "Started timing..." message will now be able to process it.
       resetProvisionalLapState()
       
-      -- Snapshot the PBs for the UI to show the correct [PB] time for the completed lap
       local lastTrackName = last.track
       snapshotActivePB(lastTrackName)
       
@@ -1084,10 +1028,7 @@ ac.onChatMessage(function(message, senderCarIndex)
   if senderCarIndex == -1 then
     local msg_str = tostring(message or "")
 
-    -- REVISED SIMULATION LOGIC
     if __SIMULATE_MESSAGE_DELAY and (msg_str:find("Started timing") or msg_str:find("Lap time") or msg_str:find("Sector time")) then
-      -- If the simulation is on, ALWAYS intercept the relevant message types.
-      -- Overwriting a pending message is the correct behavior for a rapid reset scenario.
       local delay = MIN_DELAY + math.random() * (MAX_DELAY - MIN_DELAY)
       local process_at = os.preciseClock() + delay
       
@@ -1095,7 +1036,6 @@ ac.onChatMessage(function(message, senderCarIndex)
       
       ac.log(string.format("[DEBUG DELAY] Intercepted/Overwrote server message. Will process in %.2f seconds.", delay))
     else
-      -- Process immediately if simulation is off OR it's a message type we don't delay.
       feed(msg_str)
     end
   end
@@ -1104,45 +1044,88 @@ ac.onChatMessage(function(message, senderCarIndex)
 end)
 
 -- ===== UI =====
-local function labelText(txt, invalidFlag)
-  if invalidFlag then
-    textColoredCompat(txt, COL_RED)
-  else
-    ui.text(txt)
-  end
+
+-- NEW: DWrite Font Objects
+local DeltaFont = ui.DWriteFont('Segoe UI', '@System')
+    :weight(ui.DWriteFont.Weight.Bold)
+    :style(ui.DWriteFont.Style.Normal)
+    :stretch(ui.DWriteFont.Stretch.Normal)
+
+local MainFont = ui.DWriteFont('Segoe UI', '@System')
+    :weight(ui.DWriteFont.Weight.Normal)
+    :style(ui.DWriteFont.Style.Normal)
+    :stretch(ui.DWriteFont.Stretch.Normal)
+
+local MainFontItalic = ui.DWriteFont('Segoe UI', '@System')
+    :weight(ui.DWriteFont.Weight.Normal)
+    :style(ui.DWriteFont.Style.Italic)
+    :stretch(ui.DWriteFont.Stretch.Normal)
+
+    -- NEW: Variable to hold the calculated vertical item spacing for the current font size
+local _current_item_spacing_y = 4 -- Default fallback value
+
+
+-- NEW: Helper to draw a full line of text and move to the next line.
+local function drawDWriteTextLine(text, color)
+    color = color or rgbm(1,1,1,1)
+    ui.dwriteText(text, settings.baseFontSize, color)
 end
 
-local function sectorLine(i, val, inv, pbVal, showDelta, showPB)
-  -- Label: red if invalid
-  labelText(string.format("S%-4d", i) , inv)
-  if ui.sameLine then ui.sameLine() end
+-- MODIFIED: Reworked version of sectorLineDWrite for column alignment
+local function sectorLineDWrite(i, val, inv, pbVal, showDelta, showPB)
+  local startCursorPos = ui.getCursor()
+  
+  -- Helper to draw a text segment at a specific x,y and return the new x-coordinate
+  local function drawSegment(text, color, x_pos)
+    color = color or rgbm(1, 1, 1, 1)
+    ui.dwriteDrawText(text, settings.baseFontSize, vec2(x_pos, startCursorPos.y), color)
+    return x_pos + ui.measureDWriteText(text, settings.baseFontSize).x
+  end
+
+  -- Column 1: Draw the Label
+  local labelText = string.format("S%d", i)
+  ui.dwriteDrawText(labelText, settings.baseFontSize, startCursorPos, inv and COL_RED or nil)
+
+  -- Column 2: Draw the rest of the line, starting from a fixed x-position
+  local current_x = startCursorPos.x + _max_label_width
 
   -- Time: pace color (green ≤ PB, yellow > PB)
-  local tcol = paceColor(val, pbVal, false)
-  local ttxt = " " .. fmt(val)
-  if tcol then textColoredCompat(ttxt, tcol) else ui.text(ttxt) end
+  current_x = drawSegment(" " .. fmt(val), paceColor(val, pbVal, false), current_x)
 
   -- PB bracket (neutral)
   if showPB and pbVal then
-    if ui.sameLine then ui.sameLine() end
-    ui.text(string.format(" [%s]", fmt(pbVal)))
+    current_x = drawSegment(string.format(" [%s]", fmt(pbVal)), nil, current_x)
   end
 
-  -- Delta (green negative, yellow positive, neutral ~0)
+  -- Delta (green negative, yellow positive)
   if showDelta and val and pbVal then
-    drawDeltaInline(val - pbVal)
+    local delta = val - pbVal
+    if math.abs(delta) >= 0.005 then
+      local sign = (delta >= 0) and "+" or ""
+      local deltaText = string.format(" (%s%.2f)", sign, delta)
+      local deltaColor = (delta < 0) and COL_GREEN or COL_YELLOW
+      current_x = drawSegment(deltaText, deltaColor, current_x)
+    end
   end
+
+  -- After drawing the whole line, advance the main UI cursor for the next line.
+  local lineHeight = ui.measureDWriteText(" ", settings.baseFontSize).y
+  ui.offsetCursorY(lineHeight + _current_item_spacing_y)
 end
 
-local function drawLapBlock(title, lap, opts)
-  -- NEW: Handle the PB notification title
+-- NEW: Reworked version of drawLapBlock using dwrite
+local function drawLapBlockDWrite(title, lap, opts)
   if title == "Last Lap" then
     if show_pb_notification then
       local notification_text = string.format("PB for %s saved", pb_notification_route_name)
-      textColoredCompat(notification_text, COL_GREEN)
+      drawDWriteTextLine(notification_text, COL_GREEN)
     else
-      ui.text("Last Lap")
+      drawDWriteTextLine("Last Lap")
     end
+  elseif title == "Current Lap" then
+      -- Don't draw "Current Lap" title to save space
+  else
+      drawDWriteTextLine(title)
   end
 
   local forCountName = (lap.track and lap.track ~= "" and lap.track) or (opts.fallbackTrackName or "")
@@ -1152,165 +1135,122 @@ local function drawLapBlock(title, lap, opts)
     local v  = lap.secs[i]
     local iv = lap.inv[i]
     local pbForColor = (opts.pbRef and opts.pbRef.secs and opts.pbRef.secs[i]) or nil
-    sectorLine(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB)
+    sectorLineDWrite(i, v, iv, pbForColor, opts.showDeltas, opts.showSectorPB)
   end
 
-  -- LAP label (red if invalid)
-  labelText("LAP:", lap.lapInv)
-  if ui.sameLine then ui.sameLine() end
-
+  -- LAP line using the same direct drawing and alignment method
+  local startCursorPos = ui.getCursor()
+  local function drawSegment(text, color, x_pos)
+    color = color or rgbm(1, 1, 1, 1)
+    ui.dwriteDrawText(text, settings.baseFontSize, vec2(x_pos, startCursorPos.y), color)
+    return x_pos + ui.measureDWriteText(text, settings.baseFontSize).x
+  end
+  
+  -- Column 1: LAP label (red if invalid)
+  ui.dwriteDrawText("LAP:", settings.baseFontSize, startCursorPos, lap.lapInv and COL_RED or nil)
+  
+  -- Column 2: The rest of the line
+  local current_x = startCursorPos.x + _max_label_width
+  
   -- LAP time pace-colored vs PB lap
   local lapPB = opts.pbRef and opts.pbRef.lap or nil
-  local lapCol = paceColor(lap.lap, lapPB, false)
-  local lapText = " " .. fmt(lap.lap)
-  if lapCol then textColoredCompat(lapText, lapCol) else ui.text(lapText) end
+  current_x = drawSegment(" " .. fmt(lap.lap), paceColor(lap.lap, lapPB, false), current_x)
 
   -- Optional [PB]
   if opts.showLapPB and lapPB then
-    if ui.sameLine then ui.sameLine() end
-    ui.text(string.format(" [%s]", fmt(lapPB)))
+    current_x = drawSegment(string.format(" [%s]", fmt(lapPB)), nil, current_x)
     if opts.pbRef and opts.pbRef.theoretical then
-      if ui.sameLine then ui.sameLine() end
-      ui.text("*")
+      current_x = drawSegment("*", nil, current_x)
     end
   end
+
+  -- NEW: Add delta calculation and drawing for the total lap time
+  if opts.showDeltas and lap.lap and lapPB then
+    local delta = lap.lap - lapPB
+    if math.abs(delta) >= 0.005 then
+      local sign = (delta >= 0) and "+" or ""
+      local deltaText = string.format(" (%s%.2f)", sign, delta)
+      local deltaColor = (delta < 0) and COL_GREEN or COL_YELLOW
+      current_x = drawSegment(deltaText, deltaColor, current_x)
+    end
+  end
+
+  -- Final newline after the LAP line
+  local lineHeight = ui.measureDWriteText(" ", settings.baseFontSize).y
+  ui.offsetCursorY(lineHeight + _current_item_spacing_y)
 end
 
-local function drawDebugGates()
-  -- Draw the gates for the currently loaded route (if any)
-  if #current_route.gates > 0 then
-    local owncar = ac.getCar(0)
-    if not owncar or not owncar.position then return end
-    
-    local GATE_HEIGHT = 0.5
-    local COL_START_FINISH = rgbm(0.2, 0.8, 0.2, 0.6)
-    local COL_NEXT_GATE    = rgbm(0.8, 0.8, 0.2, 0.8)
-    local COL_NORMAL_GATE  = rgbm(0.4, 0.6, 1.0, 0.5)
-
-    local car_pos = owncar.position
-    local next_gate_to_cross = last_gate_crossed_index + 1
-
-    for i, gate in ipairs(current_route.gates) do
-      local color = COL_NORMAL_GATE
-      if i == 1 then color = COL_START_FINISH end
-      if i == next_gate_to_cross then color = COL_NEXT_GATE end
-
-      local ground_y = car_pos.y
-      local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)
-      local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)
-      local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z)
-      local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z)
-      render.quad(corner_bl, corner_br, corner_tr, corner_tl, color)
-    end
-  end
-
-  -- NEW: Draw all global trigger gates in a distinct color
-  do
-    local owncar = ac.getCar(0)
-    if not owncar or not owncar.position then return end
-
-    local GATE_HEIGHT = 0.5
-    local COL_TRIGGER_GATE = rgbm(1.0, 0.2, 0.8, 0.7) -- Bright Magenta
-
-    local car_pos = owncar.position
-    local ground_y = car_pos.y
-
-    for routeName, gate in pairs(trigger_gates) do
-      local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)
-      local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)
-      local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z)
-      local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z)
-      render.quad(corner_bl, corner_br, corner_tr, corner_tl, COL_TRIGGER_GATE)
-    end
-  end
-end
-
--- NEW RENDER HOOK for drawing in the 3D world
--- This is the correct way to draw objects in the game scene.
 render.on('main.root.transparent', function()
-  -- This function is called every frame during the 3D rendering phase.
-  
-  -- We check our setting here. If it's enabled, we call the drawing function.
   if settings.showDebugGates then
-    
-    -- THE FIX:
-    -- 1. Enable depth testing so our gates render behind solid objects.
     render.setDepthMode(render.DepthMode.ReadOnlyLessEqual)
-
-    -- 2. Call our drawing function as before.
     drawDebugGates()
-
-    -- 3. IMPORTANT: Reset the depth mode to default so we don't break other rendering.
     render.setDepthMode(render.DepthMode.Default)
-
   end
 end)
 
--- HELPER for adding a tooltip to the previous UI item
 local function setTooltipOnHover(text)
   if ui.itemHovered() then
     ui.setTooltip(text)
   end
 end
 
+-- NEW: Function to calculate layout dimensions based on current font size
+local function calculateLayoutMetrics()
+    local labels = {"S1", "S2", "S3", "S4", "LAP:"} -- S4 for tracks like Bayshore
+    local maxWidth = 0
+    for _, label in ipairs(labels) do
+        local width = ui.measureDWriteText(label, settings.baseFontSize).x
+        if width > maxWidth then
+            maxWidth = width
+        end
+    end
+    -- Add a small padding for the space between the label and the time
+    _max_label_width = maxWidth + 5 
 
-local DeltaFont = ui.DWriteFont('Arial', './data')
-    :weight(ui.DWriteFont.Weight.Bold)
-    :style(ui.DWriteFont.Style.Normal)
-    :stretch(ui.DWriteFont.Stretch.Normal)
+    -- Calculate vertical item spacing
+    local oneLineHeight = ui.measureDWriteText("A", settings.baseFontSize).y
+    local twoLineHeight = ui.measureDWriteText("A\nA", settings.baseFontSize).y
+    _current_item_spacing_y = twoLineHeight - (oneLineHeight * 2)
+end
 
-    
-
+-- MODIFIED: windowMain now calculates metrics once per frame
 function windowMain(dt)
-
-  -- ===== NEW: Process Delayed Message =====
   if pending_message_data then
-    local current_time = os.preciseClock() -- THE FIX: Use os.preciseClock()
+    local current_time = os.preciseClock()
     if current_time >= pending_message_data.process_at then
       ac.log("[DEBUG DELAY] Processing delayed message now.")
       feed(pending_message_data.message)
-      pending_message_data = nil -- Clear it so we can accept the next one
+      pending_message_data = nil
     end
   end
-  -- ======================================
 
-  -- LAZY-LOADING FOR TRIGGER GATES
-  -- This runs only ONCE on the first frame the UI is active.
   if not _trigger_gates_loaded then
-    _trigger_gates_loaded = true -- Set flag immediately to prevent re-running
+    _trigger_gates_loaded = true
     ac.log("[Triggers] UI is active. Performing initial load of trigger gates...")
     loadTriggerGates()
   end
 
-  -- LAZY-LOADING FOR SAVED PBs
-  -- This runs only ONCE on the first frame the UI is active, guaranteeing
-  -- that car and session data is available for the load functions to use.
   if not _initial_pbs_loaded then
-    _initial_pbs_loaded = true -- Set flag immediately to prevent re-running
+    _initial_pbs_loaded = true
     ac.log("[Saves] UI is active. Performing initial load of PBs for current car...")
     
     local ok, err = loadAllPBsForCar()
     if ok then
-      _saved_pbs_loaded = true -- This flag is for the UI button's logic
+      _saved_pbs_loaded = true
       ac.log("[Saves] Initial load successful.")
     else
       _saved_pbs_loaded = false
       ac.log("[Saves] Initial load failed or no PBs found: " .. tostring(err))
     end
     
-    -- After loading, immediately refresh the active PB for the current track
-    -- to ensure the UI updates on this same frame.
     snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
   end
 
-  if settings.showBackground then
+  if settings.showBackground or _temp_background_on then
     local p1 = vec2(0, 0)
-    --local p2 = ui.windowSize()
-    local p2 = vec2(300,350)
+    local p2 = ui.windowSize()
     local col = ui.styleColor(ui.StyleColor.WindowBg)
-    
-    local rounding =0.0 
-    
+    local rounding = 0.0 
     ui.drawRectFilled(p1, p2, col, rounding)
   end
 
@@ -1319,196 +1259,158 @@ function windowMain(dt)
   end
 
   cleanupExpiredPreemptiveTimers(dt)
-
   checkTriggerGateCrossings(dt)
-  
   checkGateCrossing(dt)
 
   do
-  local owncar = ac.getCar(0)
-  if owncar and owncar.position then
-    local p = owncar.position
-    last_pos = { x = p.x, y = p.y, z = p.z }
+    local owncar = ac.getCar(0)
+    if owncar and owncar.position then
+      local p = owncar.position
+      last_pos = { x = p.x, y = p.y, z = p.z }
+    end
   end
-end
 
-   -- If the MAIN reference mode changed (Session vs All-Time), resnapshot immediately
   if lastRefToggle ~= settings.useSessionPB then
     lastRefToggle = settings.useSessionPB
     snapshotActivePB(current.track ~= "" and current.track or last.track or "")
   end
   
-  -- If the SESSION reference mode changed (Fastest Lap vs Best Sectors), resnapshot immediately
   if lastSessionRefToggle ~= settings.refBestSectors then
     lastSessionRefToggle = settings.refBestSectors
     snapshotActivePB(current.track ~= "" and current.track or last.track or "")
   end
+  
+  -- MODIFIED: Use the correct font stack for DWrite
+  ui.pushDWriteFont(MainFont)
 
- -- ===== DELTA DISPLAY (WITH ON-DEMAND LOADING) =====
-
--- 1. Determine the title and tooltip text based on the current mode
-local titleText, tooltipText
-if settings.useSessionPB then
-  titleText = "Lap Delta Mode: Session PB"
-  tooltipText = "Reference: Personal Best lap from this session.\nClick to load and switch to All-Time PB."
-else
-  titleText = "Lap Delta Mode: Saved PB"
-  tooltipText = "Reference: All-Time Personal Best (MUST BE VALID).\nClick to switch to Session Best."
-end
-
--- 2. Draw the title and the button on the same line
-ui.text(titleText)
-ui.sameLine()
-
--- 3. Create the button with the new on-demand loading logic
-if ui.iconButton('toggle_icon.png##MainModeToggle', vec2(20, 20), nil, nil, 0) then
-  -- If we are switching TO Saved PB mode...
-  if settings.useSessionPB == true then
-    -- ...and we haven't loaded the PBs yet this session...
-    if not _saved_pbs_loaded then
-      ac.log("[Saves] Loading PBs on-demand from main UI button.")
-      local ok, err = loadAllPBsForCar()
-      if ok then
-        _saved_pbs_loaded = true -- Mark PBs as loaded for this session
-      else
-        ac.log("[Saves] On-demand load failed: " .. tostring(err))
-      end
+  calculateLayoutMetrics()
+  
+  -- ===== DELTA DISPLAY (WITH ON-DEMAND LOADING & ITALICS) =====
+  do
+    local tooltipText
+    if settings.useSessionPB then
+      tooltipText = "Reference: Personal Best lap from this session.\nClick to load and switch to All-Time PB."
+    else
+      tooltipText = "Reference: All-Time Personal Best (MUST BE VALID).\nClick to switch to Session Best."
     end
+    
+    -- Draw text in two parts for italics
+    ui.dwriteText("Lap Delta Mode: ", settings.baseFontSize)
+    ui.sameLine(0, 5)
+    
+    -- MODIFIED: Use the correct font stack push for italics
+    ui.pushDWriteFont(MainFontItalic)
+    local italicPart = settings.useSessionPB and "Session PB" or "Saved PB"
+    ui.dwriteText(italicPart, settings.baseFontSize)
+    ui.popDWriteFont() -- MODIFIED
+    
+    ui.sameLine()
+
+    if ui.iconButton('toggle_icon.png##MainModeToggle', vec2(20, 20), nil, nil, 0) then
+      if settings.useSessionPB == true then
+        if not _saved_pbs_loaded then
+          ac.log("[Saves] Loading PBs on-demand from main UI button.")
+          local ok, err = loadAllPBsForCar()
+          if ok then _saved_pbs_loaded = true
+          else ac.log("[Saves] On-demand load failed: " .. tostring(err))
+          end
+        end
+      end
+      settings.useSessionPB = not settings.useSessionPB
+      snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
+    end
+    setTooltipOnHover(tooltipText)
   end
 
-  -- Flip the setting regardless of whether the load succeeded
-  settings.useSessionPB = not settings.useSessionPB
-  
-  -- Immediately update the UI to reflect the change
-  snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
-end
-setTooltipOnHover(tooltipText)
-
-  -- 4. The rest of the delta display logic remains the same
-  DeltaFont = DeltaFont or ui.DWriteFont('Arial', './data')
-      :weight(ui.DWriteFont.Weight.Bold)
-      :style(ui.DWriteFont.Style.Normal)
-      :stretch(ui.DWriteFont.Stretch.Normal)
-
-  -- NEW: VISUAL SMOOTHING CALCULATION
-  -- This runs every frame to smoothly animate the bar.
   do
-    -- THE FIX: Ensure our target value is never nil before passing it to lerp.
-    -- If smoothed_delta_rate_of_change is nil, we treat our target as 0.0.
     local target_rate = smoothed_delta_rate_of_change or 0.0
-    
-    -- Also ensure the visual_bar_rate itself is not nil, initializing it to 0.0 if necessary.
     visual_bar_rate = visual_bar_rate or 0.0
-
-    -- math.lerp(current, target, factor) moves current towards target
-    -- dt * SPEED makes the animation frame-rate independent.
     visual_bar_rate = math.lerp(visual_bar_rate, target_rate, dt * VISUAL_SMOOTHING_SPEED)
   end
 
-  -- MODIFIED: DELTA RATE OF CHANGE VISUALIZER BAR
   do
-    -- Configuration for the bar's appearance and behavior
-    local BAR_TOTAL_WIDTH = 150
+    local BAR_TOTAL_WIDTH = math.max(100, ui.availableSpaceX())
     local BAR_HEIGHT = 8
     local BAR_MAX_RATE = 0.25 
     local BAR_BG_COLOR = rgbm(0.2, 0.2, 0.2, 0.8)
-
     local bar_start_pos = ui.getCursor()
-    
-    -- Draw the background container for the bar
     ui.drawRectFilled(bar_start_pos, bar_start_pos + vec2(BAR_TOTAL_WIDTH, BAR_HEIGHT), BAR_BG_COLOR, 2.0)
-
-    -- MODIFIED: Use the visually smoothed value for drawing. No nil check is needed anymore.
     local normalized_rate = math.clamp(visual_bar_rate / BAR_MAX_RATE, -1.0, 1.0)
-    
-    -- Calculate geometry
     local half_width = BAR_TOTAL_WIDTH / 2
     local center_x = bar_start_pos.x + half_width
     local bar_segment_width = normalized_rate * half_width
-
-    -- Draw the colored segment
-    if bar_segment_width > 0.1 then -- Losing time, draw to the right (added threshold to avoid tiny slivers)
+    if bar_segment_width > 0.1 then
       local p1 = vec2(center_x, bar_start_pos.y)
       local p2 = vec2(center_x + bar_segment_width, bar_start_pos.y + BAR_HEIGHT)
       ui.drawRectFilled(p1, p2, COL_YELLOW, 2.0)
-    elseif bar_segment_width < -0.1 then -- Gaining time, draw to the left (added threshold)
+    elseif bar_segment_width < -0.1 then
       local p1 = vec2(center_x + bar_segment_width, bar_start_pos.y)
       local p2 = vec2(center_x, bar_start_pos.y + BAR_HEIGHT)
       ui.drawRectFilled(p1, p2, COL_GREEN, 2.0)
     end
-    
-    -- Advance the cursor to leave space for the delta number below
     ui.offsetCursorY(BAR_HEIGHT + 4)
   end
-  -- END NEW BAR
 
-  -- Draw the delta big and colored
-  ui.pushFont(DeltaFont)
-  local deltaFontSize = 36
-
+  ui.pushDWriteFont(DeltaFont)
+  local deltaFontSize = settings.baseFontSize * 2.2
   if live_delta_value ~= nil then
     local delta_text = string.format("%+.2f", live_delta_value)
     local col
-    if live_delta_value > 0 then
-      col = rgbm(0.88, 0.79, 0.37, 1.0)  -- yellow
-    elseif live_delta_value < 0 then
-      col = rgbm(0.52, 0.88, 0.52, 1.0)  -- green
-    else
-      col = rgbm(1.0, 1.0, 1.0, 1.0)  -- white
+    if live_delta_value > 0 then col = rgbm(0.88, 0.79, 0.37, 1.0)
+    elseif live_delta_value < 0 then col = rgbm(0.52, 0.88, 0.52, 1.0)
+    else col = rgbm(1.0, 1.0, 1.0, 1.0)
     end
     ui.dwriteText(delta_text, deltaFontSize, col)
   else
     ui.dwriteText("-.--", deltaFontSize, rgbm(1, 1, 1, 1))
   end
-  ui.popFont()
-
+  ui.popDWriteFont()
   ui.separator()
   
-  -- =======================================================
   
-  -- NEW: Route Name and Session Reference Toggle
   do
-    -- Only show the button if in Session PB mode
     if settings.useSessionPB then
-      if ui.iconButton('toggle_icon.png##SessionRefToggle', vec2(16, 16), nil, nil, 0) then
+      if ui.iconButton('toggle_icon.png##SessionRefToggle', vec2(20, 20), nil, nil, 0) then
         settings.refBestSectors = not settings.refBestSectors
       end
       if ui.itemHovered() then
         local currentMode = settings.refBestSectors and "Best Sectors*" or "Fastest Lap"
-        local newMode = settings.refBestSectors and "Fastest Lap" or "Best Sectors*"
-        ui.setTooltip("Current: " .. currentMode .. "\n\nToggles whether the app displays your fastest sectors from the session or the sectors from your fastest lap of the session.\n\n* symbol indicates a theoretical laptime by combining all your best sectors.")
+        ui.setTooltip("Current: " .. currentMode .. "\n\nToggles between fastest sectors and sectors from fastest lap.\n\n* indicates a theoretical laptime.")
       end
-      ui.sameLine(nil, 4) -- Add a small space
+      ui.sameLine(nil, 5)
     end
+    
+    ui.dwriteText("Route: ", settings.baseFontSize)
+    ui.sameLine(0, 5)
 
-    -- Determine the route name to display
+    -- MODIFIED: Use the correct font stack push for italics
+    ui.pushDWriteFont(MainFontItalic)
     local routeName = (current.track and current.track ~= "") and current.track
                    or (last.track and last.track ~= "") and last.track
                    or "N/A"
-    ui.text("Route: " .. routeName)
+    ui.dwriteText(routeName, settings.baseFontSize)
+    ui.popDWriteFont()
   end
 
-  -- CURRENT LAP (brackets + deltas)
-  drawLapBlock("Current Lap", current, {
+  drawLapBlockDWrite("Current Lap", current, {
     showDeltas        = true,
     showSectorPB      = true,
     showLapPB         = true,
     pbRef             = activePB,
     fallbackTrackName = last.track
   })
-
-  -- LAST LAP (always visible; pace-colored times; no brackets/deltas)
   ui.separator()
-  drawLapBlock("Last Lap", last, {
+  drawLapBlockDWrite("Last Lap", last, {
     showDeltas        = false,
     showSectorPB      = false,
     showLapPB         = false,
     pbRef             = activePB,
     fallbackTrackName = current.track
   })
+
+  ui.popDWriteFont()
 end
 
--- Reset all session data (laps, sectors, PBs)
 local function resetAllData()
   bestSecs, bestLap = {}, {}
   current = newLapState()
@@ -1520,11 +1422,10 @@ local function drawGateEditor()
   ui.text("Manual Route & Gate Setup")
   ui.separator()
 
-  -- Input for the route name
   local route_name_in_box = ui.inputText("Route Name", current_route.name or "")
-  current_route.name = route_name_in_box -- Keep our state in sync with the box
+  current_route.name = route_name_in_box
 
-   local button_text = auto_placement_active and "Stop Automatic Placement" or "Start Automatic Gate Placement"
+  local button_text = auto_placement_active and "Stop Automatic Placement" or "Start Automatic Gate Placement"
   local button_color = auto_placement_active and COL_RED or nil
   
   if ui.button(button_text, nil, button_color) then
@@ -1538,31 +1439,23 @@ local function drawGateEditor()
   end
 
   settings.auto_placement_interval = ui.slider("Placement Interval", settings.auto_placement_interval, 0.2, 5.0, "%.1f s")
-
   ui.separator()
   ui.text("Create Gates:")
 
-  -- This button now creates a trigger gate for the current route name
   if ui.button("Add Trigger Gate for Current Route") then
     local routeName = current_route.name
     if routeName and routeName ~= "" then
       local owncar = ac.getCar(0)
       local car_pos = owncar.position
-      
       local forward_vec2 = vec2(owncar.look.x, owncar.look.z):normalize()
       local side_vec2 = vec2(-forward_vec2.y, forward_vec2.x)
-      
       local half_width = GATE_WIDTH / 2.0
-      
       local point_a_vec2 = vec2(car_pos.x, car_pos.z) + side_vec2 * half_width
       local point_b_vec2 = vec2(car_pos.x, car_pos.z) - side_vec2 * half_width
-      
       local new_gate = {
         p1 = { x = point_a_vec2.x, z = point_a_vec2.y },
         p2 = { x = point_b_vec2.x, z = point_b_vec2.y }
       }
-      
-      -- Add or update the gate in our global table and save
       trigger_gates[routeName] = new_gate
       ac.log("Trigger gate created/updated for route '" .. routeName .. "'.")
       saveTriggerGates()
@@ -1571,11 +1464,9 @@ local function drawGateEditor()
     end
   end
 
-  -- Slider to configure gate width
   GATE_WIDTH = ui.slider("Gate Width", GATE_WIDTH, 10, 80, "%.0f m")
   ui.separator()
 
-  -- UI for managing the normal route file
   ui.text("Manage Route:")
   if ui.button("Save Route") and current_route.name ~= "" then
     local route_json_string = json.encode(current_route)
@@ -1602,29 +1493,36 @@ local function drawGateEditor()
   end
 end
 
-
--- Separate Settings window (gear button)
 function windowSettings(dt)
-  -- Helper to avoid nil-table crashes when counting
   local function tlen(t) return (type(t) == "table") and #t or 0 end
 
   ui.tabBar("SettingsTabs", function()
-
-    -- ===== Main Settings Tab (was "Display") =====
-    ui.tabItem("Settings", function() -- Renamed tab from "Display" to "Settings"
-      --ui.text("Sector Times Settings")
-      --ui.separator()
-
+    ui.tabItem("Settings", function()
       if ui.checkbox("Toggle App Background", settings.showBackground) then
-    settings.showBackground = not settings.showBackground
-  end
-  --ui.separator()
+        settings.showBackground = not settings.showBackground
+      end
 
-      -- Checkbox for counting invalids removed, as per your request
+      -- Font size slider
+      settings.baseFontSize = ui.slider("Font Size", settings.baseFontSize, 12.0, 36.0, "%.0f px")
+      
+      -- NEW LOGIC: Temporarily show background while dragging the slider
+      if ui.itemActive() then
+        -- ui.itemActive() is true while the user is holding the mouse on the slider
+        if not settings.showBackground then
+          -- If the background is normally off, set our temporary flag to show it.
+          _temp_background_on = true
+        end
+      elseif _temp_background_on then
+        -- If the item is no longer active (mouse released) and our flag is on,
+        -- it's time to turn the temporary background off.
+        _temp_background_on = false
+      end
+      
+      setTooltipOnHover("Adjusts the base font size for the main display.\nResize the window after changing.")
+      
       if ui.checkbox("Count invalid laps towards session PB's", settings.countInvalids) then
         settings.countInvalids = not settings.countInvalids
       end
-
       do
         local tooltip_text = "Toggles whether the app can use your best invalid laps/sectors of this session as a reference.\n\nThis setting does not affect all-time Saved PB's which are saved to disk and can be loaded in future sessions, those MUST be valid."
         setTooltipOnHover(tooltip_text)
@@ -1633,32 +1531,23 @@ function windowSettings(dt)
       ui.separator()
       ui.separator()
       
-      --ui.text("Personal Best Management")
-      --ui.text()
-      
       local cr     = current_route or { name = "", gates = {} }
       local loopName = (cr.name ~= "" and cr.name) or (current and current.track or "") or ""
       local carKey, carLabel = getCarKeyAndLabel()
       
       ui.text("Car:  " .. tostring(carLabel))
-      
       ui.text("Loop: " .. (loopName ~= "" and loopName or "— (no route loaded)"))
-
-      --ui.separator()
-      
-      
 
       ui.sameLine()
       if ui.button("Delete saved PB for this loop") then
         local loopKey = toKey(loopName)
         if loopKey ~= "" and carKey ~= "" and carKey ~= "unknown_car" then
-          -- Get the current server type to build the correct path
           local trafficType = getServerTrafficType()
           local pbFile = appPath(SAVE_FOLDER .. trafficType .. "/" .. loopKey .. "/" .. carKey .. ".json")
           
           if io.fileExists(pbFile) then
             os.remove(pbFile)
-            bestGateSplits[loopKey] = nil -- Note: This clears the in-memory PB for the simple key
+            bestGateSplits[loopKey] = nil
             bestLap[loopKey] = nil
             active_gate_pb = {}
             activePB = { secs={}, lap=nil, theoretical=false }
@@ -1670,18 +1559,16 @@ function windowSettings(dt)
       end
     end)
     ui.tabItem("Route Editor", function()
-      
       ui.textColored("--- DEBUGGING ---", COL_YELLOW)
 
       if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
         settings.showDebugGates = not settings.showDebugGates
       end
 
-      -- NEW: UI for controlling the delay simulation
       if ui.checkbox("Simulate Server Message Delay", __SIMULATE_MESSAGE_DELAY) then
         __SIMULATE_MESSAGE_DELAY = not __SIMULATE_MESSAGE_DELAY
         if not __SIMULATE_MESSAGE_DELAY then
-          pending_message_data = nil -- Clear any pending message if we turn it off
+          pending_message_data = nil
         end
       end
       if __SIMULATE_MESSAGE_DELAY then
@@ -1691,7 +1578,6 @@ function windowSettings(dt)
         if MIN_DELAY > MAX_DELAY then MAX_DELAY = MIN_DELAY end
         ui.unindent()
       end
-      -- END NEW
 
       if ui.checkbox("Force Gate Skip (Test)", __FORCE_GATE_SKIP_TEST) then
         __FORCE_GATE_SKIP_TEST = not __FORCE_GATE_SKIP_TEST
@@ -1711,7 +1597,5 @@ end
 function windowTitle() return "Sector Times" end
 
 function windowFlags()
-  local f = ui.WindowFlags.AlwaysAutoResize  -- keep gear button visible; manifest controls SETTINGS
-  
-  return f
+  return 0
 end
