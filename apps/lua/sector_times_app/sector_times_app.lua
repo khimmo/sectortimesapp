@@ -22,6 +22,9 @@ local _max_label_width = 0
 local _current_item_spacing_y = 4 -- Default fallback value
 local _temp_background_on = false
 
+local _car_pbs_for_ui = {} -- Holds the cached list of PBs for the UI
+local _car_pbs_ui_loaded = false -- Flag to prevent reloading every frame
+
 
 local settings = ac.storage(defaults)
 local SAVE_FOLDER = "savedtimes/"
@@ -413,6 +416,64 @@ local function loadAllPBsForCar()
   return true
 end
 
+-- NEW FUNCTION: Loads and caches all PBs for the current car/server type into a UI-friendly list.
+local function loadAndCachePBsForUI()
+  -- Reset the cache
+  _car_pbs_for_ui = {}
+  
+  local carKey, carLabel = getCarKeyAndLabel()
+  if not carKey or carKey == "unknown_car" then
+    ac.log("[UI PBs] Could not identify car to load PBs.")
+    return false
+  end
+  
+  local trafficType = getServerTrafficType()
+  local specificSaveDir = appPath(SAVE_FOLDER .. trafficType .. "/")
+
+  if not io.dirExists(specificSaveDir) then
+    ac.log("[UI PBs] Save directory does not exist. No PBs to show.")
+    return false
+  end
+
+  ac.log("[UI PBs] Scanning for PBs for UI...")
+
+  local loopDirs = {}
+  io.scanDir(specificSaveDir, '*', function(entryName, attributes)
+    if attributes.isDirectory then
+      table.insert(loopDirs, entryName)
+    end
+  end)
+
+  if #loopDirs == 0 then return false end
+
+  for _, loopKey in ipairs(loopDirs) do
+    local pbFile = specificSaveDir .. loopKey .. "/" .. carKey .. ".json"
+    if io.fileExists(pbFile) then
+      local raw = io.load(pbFile)
+      if raw then
+        local ok, lapData = pcall(json.decode, raw)
+        if ok and type(lapData) == 'table' and lapData.lapMS and lapData.loopName then
+          -- Add the relevant data to our UI list
+          table.insert(_car_pbs_for_ui, {
+            loopName = lapData.loopName,
+            lapMS = lapData.lapMS,
+            created = lapData.created, -- Keep this for tooltips
+            serverSectors = lapData.serverSectors, -- Store the sector times table
+          })
+        end
+      end
+    end
+  end
+
+  -- Sort the list alphabetically by route name for consistency
+  table.sort(_car_pbs_for_ui, function(a, b)
+    return a.loopName < b.loopName
+  end)
+
+  ac.log("[UI PBs] Found " .. #_car_pbs_for_ui .. " PBs to display.")
+  return #_car_pbs_for_ui > 0
+end
+
 function script.init()
   -- This function is called once when the script loads.
   -- loadSaveIndex() -- This was referring to a commented-out variable, commenting out.
@@ -440,7 +501,7 @@ local function startNewGateLap(trackName, startTimeOffset)
 
   if pb_data_source and type(pb_data_source.gateSplits) == 'table' then
     active_gate_pb = pb_data_source.gateSplits
-    ac.log("Loaded " .. #active_gate_pb .. " PB gate splits for comparison.")
+    --ac.log("Loaded " .. #active_gate_pb .. " PB gate splits for comparison.")
   else
     active_gate_pb = {}
     ac.log("No valid PB data found for this route. Starting fresh.")
@@ -489,6 +550,44 @@ local function lines_intersect(p1, p2, p3, p4)
   local t = ((p1.x - p3.x) * (p3.z - p4.z) - (p1.z - p3.z) * (p3.x - p4.x)) / den
   local u = -((p1.x - p2.x) * (p1.z - p3.z) - (p1.z - p2.z) * (p1.x - p3.x)) / den
   return t > 0 and t < 1 and u > 0 and u < 1
+end
+
+local function drawDebugGates()
+  if #current_route.gates == 0 then return end
+
+  local owncar = ac.getCar(0)
+  if not owncar or not owncar.position then return end
+  
+  -- Configuration for the visual gates
+  local GATE_HEIGHT = 0.5 -- NEW: Much smaller height for thin strips (in meters)
+  local COL_START_FINISH = rgbm(0.2, 0.8, 0.2, 0.6) -- Green (slightly less transparent)
+  local COL_NEXT_GATE    = rgbm(0.8, 0.8, 0.2, 0.8) -- Yellow (less transparent)
+  local COL_NORMAL_GATE  = rgbm(0.4, 0.6, 1.0, 0.5) -- Blue (less transparent)
+
+  local car_pos = owncar.position
+  local next_gate_to_cross = last_gate_crossed_index + 1
+
+  for i, gate in ipairs(current_route.gates) do
+    local color = COL_NORMAL_GATE
+    if i == 1 then
+      color = COL_START_FINISH
+    elseif i == next_gate_to_cross then
+      color = COL_NEXT_GATE
+    end
+
+    -- NEW SIMPLIFIED LOGIC:
+    -- Use the car's current Y-position as the base for all gates.
+    local ground_y = car_pos.y
+
+    -- Define the 4 corners of the rectangular plane using the new height
+    local corner_bl = vec3(gate.p1.x, ground_y, gate.p1.z)       -- Bottom-Left
+    local corner_br = vec3(gate.p2.x, ground_y, gate.p2.z)       -- Bottom-Right
+    local corner_tr = vec3(gate.p2.x, ground_y + GATE_HEIGHT, gate.p2.z) -- Top-Right
+    local corner_tl = vec3(gate.p1.x, ground_y + GATE_HEIGHT, gate.p1.z) -- Top-Left
+
+    -- Draw the quad
+    render.quad(corner_bl, corner_br, corner_tr, corner_tl, color)
+  end
 end
 
 local function cleanupExpiredPreemptiveTimers(dt)
@@ -609,7 +708,7 @@ local function checkGateCrossing(dt)
   end
   
   local next_gate_index = last_gate_crossed_index + 1
-  if next_gate_index > #current_route.gates then return end
+  -- THE PROBLEMATIC LINE HAS BEEN REMOVED FROM HERE
   
   local found_gate_index = -1
 
@@ -705,37 +804,54 @@ local function checkGateCrossing(dt)
     
     last_gate_crossed_index = found_gate_index
   else
-    if ((current.track and current.track ~= "") or next(preemptive_timers) ~= nil) and #current_route.gates > 0 then
-      local next_gate_to_check_index = last_gate_crossed_index + 1
-      if next_gate_to_check_index > #current_route.gates then return end
-      local primary_gate_to_check = current_route.gates[next_gate_to_check_index]
+    -- =================================================================
+    -- NEW: HYBRID off-route detection logic
+    -- =================================================================
+    if (current.track and current.track ~= "") and #current_route.gates > 0 then
+      local target_gate = nil
+      local check_mode = "" -- For logging purposes
 
-      local gate_center_x = (primary_gate_to_check.p1.x + primary_gate_to_check.p2.x) / 2
-      local gate_center_z = (primary_gate_to_check.p1.z + primary_gate_to_check.p2.z) / 2
-      local dist_to_gate = math.sqrt((current_pos_vec3.x - gate_center_x)^2 + (current_pos_vec3.z - gate_center_z)^2)
-      
-      if dist_to_gate > 200 then
-        ac.log("Off route or reset detected! Distance to next gate is > 200m. Resetting lap state.")
+      if last_gate_crossed_index == 0 then
+        -- LAP HAS STARTED, BUT NO GATES CROSSED YET
+        -- We are in PREDICTIVE mode: check distance to the NEXT gate (Gate 1).
+        target_gate = current_route.gates[1]
+        check_mode = "predictive (to Gate 1)"
+      else
+        -- AT LEAST ONE GATE HAS BEEN CROSSED
+        -- We are in NON-PREDICTIVE mode: check distance from the LAST gate.
+        target_gate = current_route.gates[last_gate_crossed_index]
+        check_mode = "non-predictive (from Gate " .. last_gate_crossed_index .. ")"
+      end
+
+      -- If we have a valid target, perform the distance check
+      if target_gate then
+        local gate_center_x = (target_gate.p1.x + target_gate.p2.x) / 2
+        local gate_center_z = (target_gate.p1.z + target_gate.p2.z) / 2
         
-        last_gate_crossed_index = 0
-        current_run_gate_splits = {}
-        ui_gate_delta_text = "Current Lap Delta: -.--"
-        ui_gate_delta_color = nil
-        live_delta_value = nil
-        live_delta_color = nil
+        local dist_sq = (current_pos_vec3.x - gate_center_x)^2 + (current_pos_vec3.z - gate_center_z)^2
         
-        last_gate_delta_value = nil
-        time_at_last_gate = 0.0
-        delta_rate_of_change = nil
-        smoothed_delta_rate_of_change = 0.0
-
-        preemptive_timers = {}
-        current_route = { name = "", gates = {} }
-        active_route_gates = {}
-        manual_lap_timer = 0.0
-
-        if current then
-          current.track = ""
+        -- Use squared distance (200*200 = 40000) for efficiency
+        if dist_sq > 40000 then
+          ac.log(string.format("Off route detected! (%s). Distance > 200m. Resetting lap state.", check_mode))
+          
+          -- Full state reset
+          last_gate_crossed_index = 0
+          current_run_gate_splits = {}
+          ui_gate_delta_text = "Current Lap Delta: -.--"
+          ui_gate_delta_color = nil
+          live_delta_value = nil
+          live_delta_color = nil
+          last_gate_delta_value = nil
+          time_at_last_gate = 0.0
+          delta_rate_of_change = nil
+          smoothed_delta_rate_of_change = 0.0
+          preemptive_timers = {}
+          current_route = { name = "", gates = {} }
+          active_route_gates = {}
+          manual_lap_timer = 0.0
+          if current then
+            current.track = ""
+          end
         end
       end
     end
@@ -1498,6 +1614,21 @@ function windowSettings(dt)
 
   ui.tabBar("SettingsTabs", function()
     ui.tabItem("Settings", function()
+
+      ui.separator()
+
+      if ui.button("Force Reset Lap State") then
+    ac.log("[State] Manual state reset triggered by user.")
+    resetProvisionalLapState()
+    -- Also reset the 'last' lap state to clear the UI completely
+    last = newLapState()
+end
+ui.separator()
+
+if ui.itemHovered() then
+    ui.setTooltip("Use this if the app gets stuck and won't start a new lap.")
+end
+
       if ui.checkbox("Toggle App Background", settings.showBackground) then
         settings.showBackground = not settings.showBackground
       end
@@ -1558,6 +1689,83 @@ function windowSettings(dt)
         end
       end
     end)
+
+    -- =========================================================================
+    -- START: NEW "Saved PBs" TAB
+    -- =========================================================================
+    ui.tabItem("Saved PBs", function()
+      if not _car_pbs_ui_loaded then
+        loadAndCachePBsForUI()
+        _car_pbs_ui_loaded = true
+      end
+
+      local carKey, carLabel = getCarKeyAndLabel()
+      local trafficType = getServerTrafficType()
+      local displayType = (trafficType == "traffic" and "Traffic") or "No Traffic"
+
+      ui.text("Showing saved PBs for:")
+      ui.textDisabled(string.format("Car: %s", carLabel))
+      ui.textDisabled(string.format("Server Type: %s", displayType))
+      
+      ui.sameLine(nil, 20)
+      if ui.button("Refresh List") then
+        _car_pbs_ui_loaded = false
+      end
+      if ui.itemHovered() then
+        ui.setTooltip("Reloads the list of PBs from your saved files.")
+      end
+
+      ui.separator()
+
+      -- THE FIX IS HERE: We provide a fixed height to the child window.
+      -- Instead of vec2(-1, -1), we use vec2(-1, 200).
+      -- -1 for width means "fill available width".
+      -- 200 for height means "be 200 pixels tall".
+      -- This forces the parent window to be large enough to contain this area.
+      -- You can change 200 to a larger or smaller number to suit your preference.
+      ui.childWindow("PBListContainer", vec2(-1, 150), true, 0, function()
+        if #_car_pbs_for_ui == 0 then
+          ui.text("No saved PBs found for this car and server type.")
+        else
+          for i, pbData in ipairs(_car_pbs_for_ui) do
+            ui.text(pbData.loopName)
+            ui.sameLine(150) 
+            ui.textColored(fmtMS(pbData.lapMS), COL_GREEN)
+
+            if ui.itemHovered() then
+  local tooltip_lines = {}
+
+  -- Part 1: Build the sector times line
+  if pbData.serverSectors and type(pbData.serverSectors) == 'table' and #pbData.serverSectors > 0 then
+    local sector_parts = {}
+    for i, secTime in ipairs(pbData.serverSectors) do
+      -- THE ONLY CHANGE IS ON THIS LINE:
+      -- We now use fmt(secTime) to get the M:SS.ss format.
+      table.insert(sector_parts, string.format("S%d: %s", i, fmt(secTime)))
+    end
+    -- Join them all into a single string
+    table.insert(tooltip_lines, table.concat(sector_parts, " | "))
+  end
+
+  -- Part 2: Build the metadata line
+  if pbData.created then
+    table.insert(tooltip_lines, "Set on: " .. os.date("%Y-%m-%d %H:%M:%S", pbData.created))
+  end
+  
+  -- Part 3: Combine all lines into a single tooltip string
+  if #tooltip_lines > 0 then
+    ui.setTooltip(table.concat(tooltip_lines, "\n"))
+  end
+end
+          end
+        end
+      end)
+    end)
+    -- =========================================================================
+    -- END: NEW "Saved PBs" TAB
+    -- =========================================================================
+
+
     ui.tabItem("Route Editor", function()
       ui.textColored("--- DEBUGGING ---", COL_YELLOW)
 
