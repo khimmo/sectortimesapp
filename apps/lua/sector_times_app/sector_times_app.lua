@@ -1734,21 +1734,25 @@ end
 
             if ui.itemHovered() then
   local tooltip_lines = {}
+  local has_content = false -- A flag to track if we've added any lines yet
 
   -- Part 1: Build the sector times line
   if pbData.serverSectors and type(pbData.serverSectors) == 'table' and #pbData.serverSectors > 0 then
     local sector_parts = {}
     for i, secTime in ipairs(pbData.serverSectors) do
-      -- THE ONLY CHANGE IS ON THIS LINE:
-      -- We now use fmt(secTime) to get the M:SS.ss format.
       table.insert(sector_parts, string.format("S%d: %s", i, fmt(secTime)))
     end
-    -- Join them all into a single string
     table.insert(tooltip_lines, table.concat(sector_parts, " | "))
+    has_content = true -- We've added the sector line
   end
 
   -- Part 2: Build the metadata line
   if pbData.created then
+    -- THE FIX: If we already have content (the sector line), add a blank line first.
+    if has_content then
+      table.insert(tooltip_lines, "") -- This creates the empty line.
+    end
+    
     table.insert(tooltip_lines, "Set on: " .. os.date("%Y-%m-%d %H:%M:%S", pbData.created))
   end
   
