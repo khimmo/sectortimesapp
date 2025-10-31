@@ -1328,6 +1328,15 @@ local function calculateLayoutMetrics()
     _current_item_spacing_y = twoLineHeight - (oneLineHeight * 2)
 end
 
+local function openPBRootForServerType()
+  local trafficType = getServerTrafficType()            -- "traffic" | "notraffic"
+  local dir = appPath(SAVE_FOLDER .. trafficType .. "/")-- …/apps/lua/delta_srp/savedtimes/<type>/
+  if not io.dirExists(dir) then
+    io.createDir(dir)                                   -- create if missing so Explorer opens something real
+  end
+  os.openInExplorer(dir)                                -- correct API per docs
+end
+
 -- MODIFIED: windowMain now calculates metrics once per frame
 function windowMain(dt)
   if pending_message_data then
@@ -1410,7 +1419,7 @@ function windowMain(dt)
     end
     
     -- Draw text in two parts for italics
-    ui.dwriteText("Lap Delta Mode: ", settings.baseFontSize)
+    ui.dwriteText("Reference Mode: ", settings.baseFontSize)
     ui.sameLine(0, 5)
     
     -- MODIFIED: Use the correct font stack push for italics
@@ -1707,24 +1716,19 @@ end
       ui.textDisabled(string.format("Server Type: %s", displayType))
       
       ui.sameLine(nil, 20)
-      if ui.button("Refresh List") then
-        _car_pbs_ui_loaded = false
-      end
-      if ui.itemHovered() then
-        ui.setTooltip("Reloads the list of PBs from your saved files.")
-      end
+      if ui.button("Open Saved Times Folder") then
+  openPBRootForServerType()
+end
+if ui.itemHovered() then
+  ui.setTooltip("Opens the savedtimes folder where the .json time files for each route are saved. You can share your time files with others.")
+end
 
       ui.separator()
 
-      -- THE FIX IS HERE: We provide a fixed height to the child window.
-      -- Instead of vec2(-1, -1), we use vec2(-1, 200).
-      -- -1 for width means "fill available width".
-      -- 200 for height means "be 200 pixels tall".
-      -- This forces the parent window to be large enough to contain this area.
-      -- You can change 200 to a larger or smaller number to suit your preference.
+      
       ui.childWindow("PBListContainer", vec2(-1, 150), true, 0, function()
         if #_car_pbs_for_ui == 0 then
-          ui.text("No saved PBs found for this car and server type.")
+          ui.text("No saved PBs found for this car")
         else
           for i, pbData in ipairs(_car_pbs_for_ui) do
             ui.text(pbData.loopName)
