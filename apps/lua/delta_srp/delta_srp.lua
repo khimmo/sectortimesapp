@@ -1,6 +1,4 @@
 ---@diagnostic disable: lowercase-global, undefined-global
--- Sector Times HUD
--- Manual sector counts + PB snapshot per lap + reference toggle
 
 -- ===== Settings (persisted) =====
 local json = require('json')
@@ -11,13 +9,14 @@ local defaults = {
   showBackground  = true,
   countInvalids   = true,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
-  auto_placement_interval = 1.0, --(default to 1 second)
-  baseFontSize = 16.0, -- NEW: Base font size for the main UI
+  auto_placement_interval = 1.0,
+  baseFontSize = 16.0, -- Base font size for the main UI
 }
 
 -- ===== UI =====
 
--- NEW: Add these two lines
+local enable_route_editor = false
+
 local _max_label_width = 0
 local _current_item_spacing_y = 4 -- Default fallback value
 local _temp_background_on = false
@@ -186,7 +185,7 @@ local function tlen(t) if type(t)=="table" then return #t else return 0 end end
 
 
 local function appPath(rel)
-  return ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/' .. rel
+  return ac.getFolder(ac.FolderID.ACApps) .. '/lua/delta_srp/' .. rel
 end
 
 local SAVE_INDEX_FILE = 'saved_laps_index.json'  -- index kept in app root for simplicity
@@ -990,7 +989,7 @@ local function feed(msg)
       ac.log("[Triggers] No pre-emptive timer found for '" .. trk .. "'. Starting timer from message (first split may be inaccurate).")
     end
 
-    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/delta_srp/'
     local filepath = app_folder .. 'routes/' .. trk .. '.json'
     local route_json_string = io.load(filepath)
     if route_json_string then
@@ -1586,14 +1585,14 @@ local function drawGateEditor()
   ui.text("Manage Route:")
   if ui.button("Save Route") and current_route.name ~= "" then
     local route_json_string = json.encode(current_route)
-    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/delta_srp/'
     io.save(app_folder .. 'routes/' .. current_route.name .. '.json', route_json_string)
     ac.log("Route '" .. current_route.name .. "' saved.")
   end
   
   ui.sameLine()
   if ui.button("Load Route") and route_name_in_box ~= "" then
-    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/sector_times_app/'
+    local app_folder = ac.getFolder(ac.FolderID.ACApps) .. '/lua/delta_srp/'
     local route_json_string = io.load(app_folder .. 'routes/' .. route_name_in_box .. '.json')
     if route_json_string then
       current_route = json.decode(route_json_string)
@@ -1770,7 +1769,9 @@ end
     -- =========================================================================
 
 
-    ui.tabItem("Route Editor", function()
+    if enable_route_editor then
+      
+      ui.tabItem("Route Editor", function()
       ui.textColored("--- DEBUGGING ---", COL_YELLOW)
 
       if ui.checkbox("Show Gates in World (Debug)", settings.showDebugGates) then
@@ -1803,6 +1804,7 @@ end
       ui.separator()
       drawGateEditor()
     end)
+  end
   end)
 end
 
