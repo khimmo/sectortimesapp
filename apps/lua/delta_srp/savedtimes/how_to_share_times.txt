@@ -1,0 +1,14 @@
+TO SHARE YOUR TIMES:
+
+Open the correct folder (traffic or notraffic).
+
+Find the folder for the route (e.g. c1_inner) and find the .json file that matches your car’s name. That file contains the saved time data for that car's PB run. This file is what you will share with others and allow them to have a live delta against your time.
+
+
+TO IMPORT SOMEONE ELSE'S TIMES:
+
+Place the shared file inside your own savedtimes/traffic/route_name or savedtimes/notraffic/route_name folder.
+
+The next time you load into an SRP server with that same car, you’ll now be able to drive against that player’s live delta and see their splits as if they were your own PB. Make sure to set the app's Reference Mode to "Saved PB" instead of "Session Best".
+
+If you already have a time for that car on that route that you don't want to be overwritten by the newly imported file, I've included a folder "put backup times here" for you to place any files that you don't want to lose.
