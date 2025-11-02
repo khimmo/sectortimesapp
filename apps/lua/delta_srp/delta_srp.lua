@@ -6,11 +6,11 @@ local json = require('json')
 local defaults = {
   useSessionPB    = true,
   showDebugGates  = false,
-  showBackground  = true,
   countInvalids   = true,   -- include invalid sectors/laps in PBs?
   refBestSectors  = false,   -- false: fastest complete lap; true: best individual sectors (theoretical)
   auto_placement_interval = 1.0,
   baseFontSize = 16.0, -- Base font size for the main UI
+  bgOpacity = 1.0,
 }
 
 -- ===== UI =====
@@ -1370,14 +1370,12 @@ function windowMain(dt)
     snapshotActivePB(current.track ~= "" and current.track or (last and last.track or ""))
   end
 
-  if settings.showBackground or _temp_background_on then
-    local p1 = vec2(0, 0)
-    local p2 = ui.windowSize()
-    local col = ui.styleColor(ui.StyleColor.WindowBg)
-    local rounding = 0.0 
-    ui.drawRectFilled(p1, p2, col, rounding)
-  end
-
+  local p1, p2 = vec2(0, 0), ui.windowSize()
+  local base = ui.styleColor(ui.StyleColor.WindowBg)
+  local a = math.max(0.0, math.min(1.0, settings.bgOpacity or 1.0))
+  local col = rgbm(base.r, base.g, base.b, a)  -- build a new color; don’t mutate style color
+  ui.drawRectFilled(p1, p2, col, 0.0)
+  
   if settings.showDebugGates then
     drawDebugGates()
   end
@@ -1637,25 +1635,19 @@ if ui.itemHovered() then
     ui.setTooltip("Use this if the app gets stuck and won't start a new lap.")
 end
 
-      if ui.checkbox("Toggle App Background", settings.showBackground) then
-        settings.showBackground = not settings.showBackground
-      end
+settings.bgOpacity = settings.bgOpacity or 1.0
+do
+  local ref = refnumber(settings.bgOpacity)
+  if ui.slider("##bgOpacity", ref, 0.0, 1.0, "Background Opacity: %.2f") then
+    settings.bgOpacity = ref.value
+  end
+end
 
       -- Font size slider
       settings.baseFontSize = ui.slider("Font Size", settings.baseFontSize, 12.0, 36.0, "%.0f px")
       
       -- NEW LOGIC: Temporarily show background while dragging the slider
-      if ui.itemActive() then
-        -- ui.itemActive() is true while the user is holding the mouse on the slider
-        if not settings.showBackground then
-          -- If the background is normally off, set our temporary flag to show it.
-          _temp_background_on = true
-        end
-      elseif _temp_background_on then
-        -- If the item is no longer active (mouse released) and our flag is on,
-        -- it's time to turn the temporary background off.
-        _temp_background_on = false
-      end
+      
       
       setTooltipOnHover("Adjusts the base font size for the main display.\nResize the window after changing.")
       
