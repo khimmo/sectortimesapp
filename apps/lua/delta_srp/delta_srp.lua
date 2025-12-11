@@ -14,6 +14,7 @@ local defaults = {
   forceOfflineMode = false, 
   offlineTrafficRef = "notraffic", -- Controls offline folder source
   offlineRouteLock = "Auto-Detect", -- NEW: Controls the route lock logic
+  restrictToShutoko = true
 }
 
 
@@ -1449,13 +1450,12 @@ function windowMain(dt)
     -- A. TRACK VALIDATION (Shutoko Check)
     local trackName = ac.getTrackName() or ""
     local trackID = ac.getTrackID() or ""
-    -- Check both Display Name and Folder Name (ID) for the word "shutoko" (case-insensitive)
     if string.find(string.lower(trackName), "shutoko") or string.find(string.lower(trackID), "shutoko") then
         is_shutoko_track = true
-        ac.log("[Init] Shutoko track detected (" .. trackName .. "). App ENABLED.")
+        ac.log("[Init] Shutoko track detected. App ENABLED.")
     else
         is_shutoko_track = false
-        ac.log("[Init] Non-Shutoko track detected (" .. trackName .. "). App DISABLED.")
+        ac.log("[Init] Non-Shutoko track detected.")
     end
 
     -- B. Automatic Offline Detection
@@ -1466,17 +1466,15 @@ function windowMain(dt)
         is_system_offline = false
     end
     
-    -- Force settings reset
     settings.forceOfflineMode = false 
-    
     ac.log("[Init] System initialized. Offline Mode: " .. tostring(is_system_offline))
   end
 
-  -- 2. GUARD CLAUSE: STOP HERE if not on Shutoko
-  -- This prevents any UI drawing or logic from running on other maps.
-  if not is_shutoko_track then return end
+  -- 2. GUARD CLAUSE: Only stop if the setting is ENABLED and track is WRONG
+  if settings.restrictToShutoko and not is_shutoko_track then 
+      return 
+  end
 
-  -- Inside windowMain(dt)
 ac.debug("App Mode", is_system_offline and "OFFLINE (Single Player)" or "ONLINE (Multiplayer)")
 
   if pending_message_data then
@@ -1648,6 +1646,9 @@ ac.debug("App Mode", is_system_offline and "OFFLINE (Single Player)" or "ONLINE 
     if is_system_offline then
         -- === OFFLINE: DROPDOWN MENU ===
         ui.pushItemWidth(100) -- Set a fixed width for the dropdown
+        if ui.itemHovered() then
+          ui.setTooltip("Automatic route detected is not enable in offline mode. Route must be manually selected")
+      end
         
         -- 1. Build list of routes
         local routeOptions = {}
@@ -1817,6 +1818,19 @@ function windowSettings(dt)
     ui.tabItem("Settings", function()
 
       ui.separator()
+
+      ui.separator()
+      
+      -- NEW: Map Restriction Toggle
+      if ui.checkbox("Hide app UI on other tracks", settings.restrictToShutoko) then
+         settings.restrictToShutoko = not settings.restrictToShutoko
+      end
+      if ui.itemHovered() then
+          ui.setTooltip("If enabled, the app will hide itself completely on maps that are not Shutoko Revival Project.")
+      end
+      
+      ui.separator()
+
       if ui.button("Force Reset Lap State") then
         ac.log("[State] Manual state reset triggered by user.")
         resetProvisionalLapState()
@@ -1860,48 +1874,7 @@ function windowSettings(dt)
         
         ui.separator()
 
-        -- 2. ROUTE LOCK SELECTION
-        ui.text("Active Route Lock:")
         
-        local routeOptions = { "Auto-Detect" }
-        for name, _ in pairs(trigger_gates) do
-            table.insert(routeOptions, name)
-        end
-        table.sort(routeOptions)
-
-        -- Calculate current index (1-based to match Lua table)
-        local currentIdx = 1
-        for i, name in ipairs(routeOptions) do
-            if name == (settings.offlineRouteLock or "Auto-Detect") then 
-                currentIdx = i
-                break 
-            end
-        end
-
-        -- Pass 1-based index directly
-        local newIdx = ui.combo("##RouteLock", currentIdx, ui.ComboFlags.None, routeOptions)
-        
-        if newIdx ~= currentIdx then
-            -- Use 1-based index directly (No +1 or -1)
-            local selectedName = routeOptions[newIdx]
-            
-            if selectedName then
-                settings.offlineRouteLock = selectedName
-                ac.log("[Settings] Route Lock changed to: " .. selectedName)
-                
-                if selectedName ~= "Auto-Detect" and current.track ~= selectedName then
-                    resetProvisionalLapState()
-                    if loadRouteByName(selectedName) then
-                         current_route.name = selectedName
-                         ac.log("[Settings] Pre-loaded locked route: " .. selectedName)
-                    end
-                end
-            end
-        end
-        
-        if ui.itemHovered() then
-            ui.setTooltip("Auto-Detect: Switches routes when you cross any start line.\n[Route Name]: Ignores all triggers except for the selected route.")
-        end
         
         ui.unindent()
       end
