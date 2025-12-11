@@ -16,6 +16,11 @@ local defaults = {
   offlineRouteLock = "Auto-Detect", -- NEW: Controls the route lock logic
 }
 
+
+local is_shutoko_track = false
+local is_system_offline = false
+local _offline_check_done = false -- Flag to ensure we only check once
+
 -- ===== UI =====
 
 local enable_route_editor = true
@@ -166,11 +171,8 @@ local _trigger_gates_loaded = false
 -- ===== Saving system (per loop + car) =====
 
 local function getOperationMode()
-  -- If the user explicitly checked the box, be offline.
-  if settings.forceOfflineMode then return "offline" end
-  
-  -- Otherwise, ALWAYS assume online. 
-  -- This forces the preemptive timer logic to run.
+  -- Now relies purely on the automatic detection set at init
+  if is_system_offline then return "offline" end
   return "online"
 end
 
@@ -478,8 +480,33 @@ local function loadAndCachePBsForUI()
 end
 
 function script.init()
-  -- This function is called once when the script loads.
-  -- loadSaveIndex() -- This was referring to a commented-out variable, commenting out.
+  -- AUTOMATIC DETECTION (Legacy Method):
+  -- We check the server name. If it is nil or empty, we assume Offline Mode.
+  local serverName = ac.getServerName()
+  if not serverName or serverName == "" then
+      is_system_offline = true
+  else
+      is_system_offline = false
+  end
+  
+  -- Force settings reset to avoid old persistent state issues
+  settings.forceOfflineMode = false 
+  
+  ac.log("System initialized. Offline Mode detected: " .. tostring(is_system_offline))
+  
+  -- (Your existing load logic follows...)
+  loadTriggerGates()
+  
+  -- Initial PB load
+  if not _initial_pbs_loaded then
+    _initial_pbs_loaded = true
+    local ok, err = loadAllPBsForCar()
+    if ok then
+      _saved_pbs_loaded = true
+    else
+      _saved_pbs_loaded = false
+    end
+  end
 end
 
 -- ===== Helpers =====
@@ -823,7 +850,7 @@ local function checkGateCrossing(dt)
   local current_pos_vec3 = owncar.position
   
   -- Pit Lane Detection
-  if owncar.isInPitlane and manual_lap_timer > 5.0 then
+  if owncar.isInPitlane and manual_lap_timer > 2.1 then
     ac.log("[Lap Reset] Car detected in pitlane. Lap cancelled.")
     resetProvisionalLapState()
     last_pos = {x = current_pos_vec3.x, y = current_pos_vec3.y, z = current_pos_vec3.z}
@@ -1013,26 +1040,34 @@ local function feed(msg)
   if getOperationMode() == "offline" then return end
 
   -- ==========================================================
-  -- FIX: "Started timing of <track>" with Robust Matching
+  -- 1. LAP START PARSING ("Started timing of...")
   -- ==========================================================
   local trk = msg:match("^Started%s+timing%s+of%s+(.+)$")
   if trk then
     if auto_placement_active then return end
 
+    -- [FIX: SERVER AUTHORITY] 
+    -- If we are already on a track, but the server says we started a NEW one, 
+    -- we force the switch instead of ignoring it.
     if current.track and current.track ~= "" then
-      ac.log(string.format("Ignoring server start for '%s' because lap for '%s' is already official.", trk, current.track))
-      return
+       if current.track ~= trk then
+           ac.log(string.format("[Server Authority] Switching route from '%s' to '%s' based on server message.", current.track, trk))
+       else
+           ac.log(string.format("[Server Authority] Restarting lap for '%s' based on server message.", trk))
+       end
+       -- We don't need to manually reset variables here because startNewGateLap() 
+       -- called below will wipe the state/timers for us.
     end
 
     local startTimeOffset = 0.0
     local timerData = nil
     
-    -- 1. Try EXACT match first (Fastest)
+    -- A. Try EXACT match first (Fastest)
     if preemptive_timers[trk] then
         timerData = preemptive_timers[trk]
         ac.log("[Triggers] Exact name match found for: " .. trk)
     else
-        -- 2. Try LOOSE match (Fixes case sensitivity or trailing space issues)
+        -- B. Try FUZZY match (Fixes case sensitivity or trailing space issues)
         local searchKey = toKey(trk)
         for routeName, data in pairs(preemptive_timers) do
             if toKey(routeName) == searchKey then
@@ -1043,7 +1078,7 @@ local function feed(msg)
         end
     end
 
-    -- 3. Calculate Offset if timer found
+    -- C. Calculate Offset if timer found
     if timerData then
       local currentTime = os.preciseClock()
       startTimeOffset = currentTime - timerData.startTime
@@ -1060,6 +1095,7 @@ local function feed(msg)
 
     loadRouteByName(trk)
     
+    -- Start the lap with the calculated offset (or 0.0 if failed)
     startNewGateLap(current_route.name, startTimeOffset)
     current.track = trk
     snapshotActivePB(trk)
@@ -1067,7 +1103,7 @@ local function feed(msg)
   end
   
   -- ==========================================================
-  -- Existing Sector Parsing (Unchanged)
+  -- 2. SECTOR TIME PARSING
   -- ==========================================================
   do
     local m,s = msg:match("Sector%s+time:%s*(%d+):([%d%.]+)")
@@ -1101,7 +1137,7 @@ local function feed(msg)
   end
 
   -- ==========================================================
-  -- Existing Lap Finish Parsing (Unchanged)
+  -- 3. LAP FINISH PARSING
   -- ==========================================================
   do
     local m,s = msg:match("Lap%s+time%s+for%s+.-:%s*(%d+):([%d%.]+)")
@@ -1147,6 +1183,7 @@ local function feed(msg)
         end
       end
       
+      -- Handle Delta/Gate storage
       if #active_route_gates > 0 then
         local trackKey = toKey(last.track)
         local official_lap_ms = last.lap * 1000
@@ -1403,8 +1440,45 @@ local function openPBRootForServerType()
   os.openInExplorer(dir)                                -- correct API per docs
 end
 
--- MODIFIED: windowMain now calculates metrics once per frame
+
 function windowMain(dt)
+
+  if not _offline_check_done then
+    _offline_check_done = true
+    
+    -- A. TRACK VALIDATION (Shutoko Check)
+    local trackName = ac.getTrackName() or ""
+    local trackID = ac.getTrackID() or ""
+    -- Check both Display Name and Folder Name (ID) for the word "shutoko" (case-insensitive)
+    if string.find(string.lower(trackName), "shutoko") or string.find(string.lower(trackID), "shutoko") then
+        is_shutoko_track = true
+        ac.log("[Init] Shutoko track detected (" .. trackName .. "). App ENABLED.")
+    else
+        is_shutoko_track = false
+        ac.log("[Init] Non-Shutoko track detected (" .. trackName .. "). App DISABLED.")
+    end
+
+    -- B. Automatic Offline Detection
+    local serverName = ac.getServerName()
+    if not serverName or serverName == "" then
+        is_system_offline = true
+    else
+        is_system_offline = false
+    end
+    
+    -- Force settings reset
+    settings.forceOfflineMode = false 
+    
+    ac.log("[Init] System initialized. Offline Mode: " .. tostring(is_system_offline))
+  end
+
+  -- 2. GUARD CLAUSE: STOP HERE if not on Shutoko
+  -- This prevents any UI drawing or logic from running on other maps.
+  if not is_shutoko_track then return end
+
+  -- Inside windowMain(dt)
+ac.debug("App Mode", is_system_offline and "OFFLINE (Single Player)" or "ONLINE (Multiplayer)")
+
   if pending_message_data then
     local current_time = os.preciseClock()
     if current_time >= pending_message_data.process_at then
@@ -1571,16 +1645,68 @@ function windowMain(dt)
     ui.dwriteText("Route: ", settings.baseFontSize)
     ui.sameLine(0, 5)
 
-    -- MODIFIED: Use the correct font stack push for italics
-    ui.pushDWriteFont(MainFontItalic)
-    local routeName = (current.track and current.track ~= "") and current.track
-                   or (last.track and last.track ~= "") and last.track
-                   or "N/A"
-    if getOperationMode() == "offline" then
-       routeName = routeName .. " (Offline)"
+    if is_system_offline then
+        -- === OFFLINE: DROPDOWN MENU ===
+        ui.pushItemWidth(100) -- Set a fixed width for the dropdown
+        
+        -- 1. Build list of routes
+        local routeOptions = {}
+        for name, _ in pairs(trigger_gates) do
+            table.insert(routeOptions, name)
+        end
+        table.sort(routeOptions)
+
+        -- 2. Determine current selection (Default to first if nil/Auto-Detect)
+        local currentSelection = settings.offlineRouteLock
+        if not currentSelection or currentSelection == "Auto-Detect" then
+            if #routeOptions > 0 then
+                currentSelection = routeOptions[1]
+                settings.offlineRouteLock = currentSelection
+            end
+        end
+
+        -- 3. Find index for UI
+        local currentIdx = 1
+        for i, name in ipairs(routeOptions) do
+            if name == currentSelection then 
+                currentIdx = i 
+                break 
+            end
+        end
+
+        -- 4. Draw Combo
+        local newIdx = ui.combo("##MainRouteSelect", currentIdx, ui.ComboFlags.None, routeOptions)
+        
+        -- 5. Handle Change
+        if newIdx ~= currentIdx then
+            local selectedName = routeOptions[newIdx]
+            settings.offlineRouteLock = selectedName
+            ac.log("[UI] Offline Route changed to: " .. selectedName)
+            
+            -- Reset state and load new route immediately
+            resetProvisionalLapState()
+            if loadRouteByName(selectedName) then
+                 current_route.name = selectedName
+                 -- Set current track so logic knows what we are aiming for
+                 current.track = selectedName
+                 snapshotActivePB(selectedName)
+            end
+        end
+        ui.popItemWidth()
+
+        --ui.sameLine()
+        --ui.text("(Offline)")
+        -- ==============================
+    else
+        -- === ONLINE: STATIC TEXT ===
+        ui.pushDWriteFont(MainFontItalic)
+        local routeName = (current.track and current.track ~= "") and current.track
+                       or (last.track and last.track ~= "") and last.track
+                       or "N/A"
+        ui.dwriteText(routeName, settings.baseFontSize)
+        ui.popDWriteFont()
+        -- ===========================
     end
-    ui.dwriteText(routeName, settings.baseFontSize)
-    ui.popDWriteFont()
   end
 
   drawLapBlockDWrite("Current Lap", current, {
@@ -1708,13 +1834,12 @@ function windowSettings(dt)
 
       settings.baseFontSize = ui.slider("Font Size", settings.baseFontSize, 12.0, 36.0, "%.0f px")
 
-      -- === OFFLINE MODE SETTINGS ===
-      if ui.checkbox("Force Offline / Standalone Mode", settings.forceOfflineMode) then
-         settings.forceOfflineMode = not settings.forceOfflineMode
-         _initial_pbs_loaded = false
-      end
-
-      if getOperationMode() == "offline" then
+      -- === OFFLINE OPTIONS (Automatic Detection) ===
+      -- These options only appear if the app detected single player mode at startup
+      -- The manual checkbox has been removed as requested.
+      if is_system_offline then
+        ui.separator()
+        ui.text("Offline Options (Active)")
         ui.indent()
         
         -- 1. FOLDER SELECTION
@@ -1829,6 +1954,35 @@ function windowSettings(dt)
       ui.textDisabled(string.format("Folder: %s", displayType))
       ui.sameLine(nil, 20)
       if ui.button("Open Folder") then openPBRootForServerType() end
+
+      ui.sameLine()
+      if ui.button("Refresh Saved Times") then
+          ac.log("[UI] Manual refresh triggered. Reloading all PBs...")
+          
+          -- 1. Reload the internal data (for deltas/physics)
+          loadAllPBsForCar()
+          
+          -- 2. Reload the UI list
+          loadAndCachePBsForUI()
+          _car_pbs_ui_loaded = true
+          
+          -- 3. Refresh the active PB for the current track immediately
+          local trackName = current.track ~= "" and current.track or (last and last.track or "")
+          if trackName ~= "" then
+              snapshotActivePB(trackName)
+              -- If we are idle, we can also try to reload the gate delta
+              -- (This might reset the delta bar momentarily, but ensures data is fresh)
+              if #active_route_gates > 0 then
+                  local trackKey = toKey(trackName)
+                  local pb_source = settings.useSessionPB and sessionBestGateSplits[trackKey] or bestGateSplits[trackKey]
+                  if pb_source and pb_source.gateSplits then
+                      active_gate_pb = pb_source.gateSplits
+                      ac.log("[UI] Active gate PB updated from refresh.")
+                  end
+              end
+          end
+      end
+      -- ==========================
       ui.separator()
       ui.childWindow("PBListContainer", vec2(-1, 150), true, 0, function()
         if not _car_pbs_for_ui or #_car_pbs_for_ui == 0 then
